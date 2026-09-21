@@ -6,40 +6,72 @@ const bodyParser = require("body-parser");
 const app = express();
 app.use(bodyParser.json());
 
-const CLAUDE_API_KEY = "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";
-const CALENDAR_ID = "a04736570060a96ea740132b7ab1c8f98aa12b5d6e12d9dbea74fe263dfa7345@group.calendar.google.com";
-const GOOGLE_AUTH_JSON = require("./google-auth.json");
-
-const client = new Anthropic.Anthropic({ apiKey: CLAUDE_API_KEY });
-const auth = new google.auth.OAuth2(GOOGLE_AUTH_JSON.client_id, GOOGLE_AUTH_JSON.client_secret, GOOGLE_AUTH_JSON.redirect_uris[0]);
+const client = new Anthropic.Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
+const auth = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  "http://localhost:8080/callback"
+);
 const calendar = google.calendar({ version: "v3", auth });
+const CALENDAR_ID = process.env.CALENDAR_ID;
 
 const conversations = new Map();
 
-const SYSTEM_PROMPT = `Eres Canto, el asistente de Villa de Canto...`;
+const SYSTEM_PROMPT = `Eres Canto, el asistente de Villa de Canto en Amazcala, El Marques, Queretaro.
+
+DATOS:
+- Capacidad: 15 adultos + 2 ninos maximo
+- Direccion: Boulevard Rodolfo Gaona 106, Campestre Amazcala
+- Check-in 13:00 | Check-out 12:00
+- Contacto: David 33 1769 2871
+
+SERVICIOS: alberca climatizada 33-35C, horno de pizza, asador, gym, area de juegos, estacionamiento 4 autos, limpieza incluida.
+
+TARIFAS POR NOCHE:
+- Lunes a jueves y domingo: $10,500
+- Viernes: $12,000
+- Sabado: $14,000
+
+PAGO:
+- Anticipo 50% del total
+- Banco Inbursa, CLABE 036680500511854406, Titular Villa de Canto
+- Deposito en garantia $5,000 reembolsable 48h despues del checkout
+
+REGLAS:
+- No des descuentos
+- No inventes disponibilidad
+- Pide contrato firmado + INE al confirmar
+
+TONO: calido, pausado, conversacional. Emojis ocasionales. Nunca robotico.
+
+FLUJO: saluda, pregunta que necesita, recoge nombre/fechas DD-MM-AAAA/adultos/ninos/motivo/correo de forma natural, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide comprobante.`;
+
+app.get("/", (req, res) => res.json({ status: "ok", agente: "Canto" }));
 
 app.post("/webhook", async (req, res) => {
   const { phoneNumber, message } = req.body;
-  if (!phoneNumber || !message) return res.status(400).json({ error: "Datos requeridos" });
-  
-  if (!conversations.has(phoneNumber)) conversations.set(phoneNumber, { messages: [], reservation: {} });
-  const convo = conversations.get(phoneNumber);
-  convo.messages.push({ role: "user", content: message });
+  if (!phoneNumber || !message) return res.status(400).json({ error: "phoneNumber y message requeridos" });
+
+  if (!conversations.has(phoneNumber)) conversations.set(phoneNumber, []);
+  const history = conversations.get(phoneNumber);
+  history.push({ role: "user", content: message });
 
   try {
     const response = await client.messages.create({
-      model: "claude-3-5-sonnet-20241022",
+      model: "claude-sonnet-4-20250514",
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
-      messages: convo.messages,
+      messages: history,
     });
-    const assistantMessage = response.content[0].text;
-    convo.messages.push({ role: "assistant", content: assistantMessage });
-    res.json({ response: assistantMessage });
+    const reply = response.content[0].text;
+    history.push({ role: "assistant", content: reply });
+    if (history.length > 20) history.splice(0, history.length - 20);
+    res.json({ response: reply });
   } catch (error) {
-    res.status(500).json({ error: "Error procesando" });
+    console.error(error);
+    res.status(500).json({ error: error.message });
   }
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Agente en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Agente Canto en puerto ${PORT}`));
