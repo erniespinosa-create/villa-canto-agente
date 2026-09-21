@@ -1,18 +1,10 @@
-
 const Anthropic = require("@anthropic-ai/sdk");
 const { google } = require("googleapis");
 const express = require("express");
 const bodyParser = require("body-parser");
 
 const app = express();
-app.use(bodyParser.json({
-  limit: "2mb",
-  strict: false
-}));
-app.use((err, req, res, next) => {
-  if (err.type === "entity.parse.failed") return res.status(200).json({ response: "No entendí bien ese mensaje, ¿me lo repites en una sola línea?" });
-  next(err);
-});
+app.use(bodyParser.json({ limit: "2mb", strict: false }));
 
 const client = new Anthropic.Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
 const auth = new google.auth.OAuth2(
@@ -25,7 +17,15 @@ const CALENDAR_ID = process.env.CALENDAR_ID;
 
 const conversations = new Map();
 
+function hoyMexico() {
+  return new Date().toLocaleDateString("es-MX", { timeZone: "America/Mexico_City", day: "2-digit", month: "2-digit", year: "numeric", weekday: "long" });
+}
+
 const SYSTEM_PROMPT = `Eres Canto, el asistente de Villa de Canto en Amazcala, El Marques, Queretaro.
+
+FECHA DE HOY: ${hoyMexico()} (usa esto para resolver "manana", "el viernes", "este fin de semana", etc. sin preguntar)
+
+FORMATO DE FECHAS: El cliente puede escribir fechas de cualquier forma (22/09/2026, 22-09-2026, "22 de septiembre", "manana", "el viernes que entra"). Acepta y entiende cualquier formato, nunca rechaces una fecha por su formato ni pidas que la repita en un formato especifico.
 
 DATOS:
 - Capacidad: 15 adultos + 2 ninos maximo
@@ -52,9 +52,7 @@ REGLAS:
 
 TONO: calido, pausado, conversacional. Emojis ocasionales. Nunca robotico.
 
-FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo/correo de forma natural, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide comprobante.
-
-IMPORTANTE SOBRE FECHAS: El cliente puede escribir fechas en cualquier formato (22-09-2026, 22/09/2026, "22 de septiembre", "22 sept 2026", etc.) y puede venir junto con otras palabras en la misma linea (ej "check in 22-09-2026"). SIEMPRE reconoce cualquier fecha que el cliente mencione, sin importar el formato o si viene acompañada de texto. Nunca digas que no recibiste una fecha si el cliente ya escribio una - revisa TODO el mensaje, no solo el inicio.`;
+FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo/correo de forma natural, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide comprobante.`;
 
 app.get("/", (req, res) => res.json({ status: "ok", agente: "Canto" }));
 
@@ -81,6 +79,11 @@ app.post("/webhook", async (req, res) => {
     console.error(error);
     res.status(500).json({ error: error.message });
   }
+});
+
+app.use((err, req, res, next) => {
+  if (err.type === "entity.parse.failed") return res.status(200).json({ response: "No entendi bien ese mensaje, me lo repites?" });
+  next(err);
 });
 
 const PORT = process.env.PORT || 8080;
