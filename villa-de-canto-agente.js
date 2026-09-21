@@ -4,7 +4,14 @@ const express = require("express");
 const bodyParser = require("body-parser");
 
 const app = express();
-app.use(bodyParser.json());
+app.use(bodyParser.json({
+  limit: "2mb",
+  strict: false
+}));
+app.use((err, req, res, next) => {
+  if (err.type === "entity.parse.failed") return res.status(200).json({ response: "No entendí bien ese mensaje, ¿me lo repites en una sola línea?" });
+  next(err);
+});
 
 const client = new Anthropic.Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
 const auth = new google.auth.OAuth2(
