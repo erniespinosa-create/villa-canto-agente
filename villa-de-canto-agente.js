@@ -63,7 +63,7 @@ app.post("/webhook", async (req, res) => {
       system: SYSTEM_PROMPT,
       messages: history,
     });
-    const reply = response.content[0].text;
+    const reply = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
     history.push({ role: "assistant", content: reply });
     if (history.length > 20) history.splice(0, history.length - 20);
     res.json({ response: reply });
