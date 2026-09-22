@@ -16,6 +16,39 @@ const auth = new google.auth.OAuth2(
 );
 const calendar = google.calendar({ version: "v3", auth });
 const CALENDAR_ID = process.env.CALENDAR_ID;
+if (process.env.GOOGLE_REFRESH_TOKEN) auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+
+async function hayDisponibilidad(llegada, salida) {
+  const [dl, ml, al] = llegada.split("/");
+  const [ds, ms, as] = salida.split("/");
+  const start = new Date(al, ml - 1, dl, 0, 0, 0);
+  const end = new Date(as, ms - 1, ds, 23, 59, 59);
+  const existentes = await calendar.events.list({
+    calendarId: CALENDAR_ID, timeMin: start.toISOString(), timeMax: end.toISOString(),
+  });
+  return !(existentes.data.items && existentes.data.items.length > 0);
+}
+
+async function crearEventoCalendar(datos) {
+  const [dl, ml, al] = datos.llegada.split("/");
+  const [ds, ms, as] = datos.salida.split("/");
+  const start = new Date(al, ml - 1, dl, 13, 0, 0);
+  const end = new Date(as, ms - 1, ds, 12, 0, 0);
+  const existentes = await calendar.events.list({
+    calendarId: CALENDAR_ID, timeMin: start.toISOString(), timeMax: end.toISOString(), q: datos.nombre,
+  });
+  if (existentes.data.items && existentes.data.items.length > 0) return { duplicado: true };
+  const evento = await calendar.events.insert({
+    calendarId: CALENDAR_ID,
+    resource: {
+      summary: `Reserva - ${datos.nombre}`,
+      description: `Adultos: ${datos.adultos}\nNinos: ${datos.ninos || 0}\nMotivo: ${datos.motivo || "-"}`,
+      start: { dateTime: start.toISOString(), timeZone: "America/Mexico_City" },
+      end: { dateTime: end.toISOString(), timeZone: "America/Mexico_City" },
+    },
+  });
+  return { duplicado: false, id: evento.data.id };
+}
 
 const db = new sqlite3.Database(path.join("/tmp", "conversations.db"));
 db.run(`CREATE TABLE IF NOT EXISTS conversations (
@@ -73,9 +106,15 @@ REGLAS:
 
 TONO: calido, pausado, conversacional. Emojis ocasionales. Nunca robotico.
 
-EXTRACCION DE DATOS: El cliente puede darte varios datos juntos en un solo mensaje (separados por comas, saltos de linea, o mezclados en una frase) o uno por uno en mensajes distintos. Lee TODO el mensaje completo con cuidado antes de responder y extrae cada dato que encuentres (nombre, fechas, adultos, ninos, motivo), sin importar el orden, formato, o si vienen juntos o separados, incluso si van despues de palabras como "nombre completo:" o "correo:". Nunca vuelvas a pedir un dato que el cliente ya te dio en cualquier mensaje anterior de la conversacion, y nunca digas que no lo recibiste si ya esta en el historial.
+EXTRACCION DE DATOS: El cliente puede darte varios datos juntos en un solo mensaje (separados por comas, saltos de linea, o mezclados en una frase) o uno por uno en mensajes distintos. Lee TODO el mensaje completo con cuidado antes de responder y extrae cada dato que encuentres (nombre, fechas, adultos, ninos, motivo), sin importar el orden, formato, o si vienen juntos o separados, incluso si van despues de palabras como "nombre completo:" o "correo:". Nunca vuelvas a pedir un dato que el cliente ya te dio en cualquier mensaje anterior de la conversacion, y nunca digas que no lo recibiste si ya esta en el historial. SIEMPRE responde algo despues de recibir cualquier mensaje del cliente, aunque sea solo confirmar el dato recibido (ej: "Perfecto, ya tengo tu nombre completo, [nombre]. Ahora dime..."); nunca dejes un mensaje sin respuesta.
 
-FLUJO: saluda, pregunta que necesita, recoge nombre/fechas DD-MM-AAAA/adultos/ninos/motivo de forma natural, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide comprobante.`;
+FECHAS - CONFIRMA SIEMPRE: cuando el cliente te de una fecha, antes de seguir, repitela de vuelta con el dia de la semana para confirmar que la entendiste bien (ej: "entonces llegan el sabado 26/09/2026, ¿verdad?"). Si la fecha es ambigua o no puedes resolverla con certeza, pregunta el dia y mes exactos en numeros.
+
+FLUJO: saluda, pregunta que necesita, recoge nombre/fechas DD-MM-AAAA/adultos/ninos/motivo de forma natural, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide comprobante.
+
+CUANDO TENGAS nombre, fecha de llegada, fecha de salida y numero de adultos completos y el cliente haya confirmado que quiere reservar, agrega al FINAL de tu respuesta, en su propia linea, exactamente esto (el cliente no lo vera, se procesa aparte):
+RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"..."}
+Solo agrega esa linea UNA vez por reserva confirmada, no la repitas en mensajes posteriores de la misma conversacion.`;
 
 app.get("/", (req, res) => res.json({ status: "ok", agente: "Canto" }));
 
@@ -89,19 +128,40 @@ app.post("/webhook", async (req, res) => {
 
     try {
       const response = await client.messages.create({
-        model: "claude-sonnet-5",
+        model: "claude-3-5-sonnet-20241022",
         max_tokens: 1024,
         system: SYSTEM_PROMPT,
         messages: history,
       });
       const reply = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+      let mensajeCliente = reply;
+      const match = reply.match(/RESERVA_JSON:(\{.*\})/);
+      if (match) {
+        mensajeCliente = reply.replace(match[0], "").trim();
+        try {
+          const datosReserva = JSON.parse(match[1]);
+          const libre = await hayDisponibilidad(datosReserva.llegada, datosReserva.salida);
+          if (!libre) {
+            mensajeCliente = mensajeCliente.replace(/\n?$/, "") + "\n\nAy, justo revisé y esas fechas ya estan ocupadas 😔 ¿Quieres que busquemos otras fechas cercanas?";
+          } else {
+            const resultado = await crearEventoCalendar(datosReserva);
+            if (resultado.duplicado) console.log("Reserva duplicada, no se creo evento:", datosReserva.nombre);
+            else console.log("Evento creado en Calendar:", resultado.id);
+          }
+        } catch (e) {
+          console.error("Error creando evento de Calendar:", e.message);
+        }
+      }
+      if (!mensajeCliente || !mensajeCliente.trim()) {
+        mensajeCliente = "Perfecto, ya quedo anotado. ¿Algo mas en lo que te pueda ayudar?";
+      }
       history.push({ role: "assistant", content: reply });
       if (history.length > 20) history.splice(0, history.length - 20);
       
       db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))", 
         [phoneNumber, JSON.stringify(history)]);
       
-      res.json({ response: reply });
+      res.json({ response: mensajeCliente });
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: error.message });
