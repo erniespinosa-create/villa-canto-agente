@@ -133,9 +133,13 @@ FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo 
 
 CUANDO el cliente confirme que quiere reservar (y ya consultaste disponibilidad y esta libre), agrega al FINAL de tu respuesta, en su propia linea, exactamente esto (el cliente no lo vera):
 RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"..."}
-Solo UNA vez por reserva confirmada.
+Solo UNA vez por cada reserva confirmada (no la repitas si solo estan platicando de la misma reserva).
+
+VARIAS RESERVAS: un mismo cliente puede hacer mas de una reserva. Si dice que quiere una reserva NUEVA u OTRA, o da fechas distintas a las de una reserva anterior, tratala como reserva nueva: pregunta las fechas y datos que falten (puedes reutilizar su nombre), consulta disponibilidad, cotiza y, cuando confirme, agrega un NUEVO RESERVA_JSON con las nuevas fechas. Nunca digas "ya la tenemos registrada" si las fechas son distintas.
 
 AVISO DE PAGO: si el cliente dice que ya deposito, ya pago, ya transfirio, o manda su comprobante, agradecele con calidez, dile que en breve confirmamos el pago, y agrega al FINAL de tu respuesta, en su propia linea, exactamente: AVISO_PAGO (el cliente no lo vera).
+
+FOTOS: si el cliente pide fotos, imagenes, ver la casa, las habitaciones o la alberca, responde con calidez algo breve como "¡Claro! Te comparto algunas fotos de la villa 📸" y agrega al FINAL de tu respuesta, en su propia linea, exactamente: ENVIAR_FOTOS (el cliente no lo vera). Las fotos se envian automaticamente; no digas que no puedes mandar fotos.
 
 MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada, pidele el contrato firmado y una foto de su INE, y dale los datos de llegada (direccion, check-in 13:00, check-out 12:00, contacto David 33 1769 2871). Nunca menciones la palabra SISTEMA.`;
 }
@@ -208,6 +212,12 @@ app.post("/webhook", (req, res) => {
         mensajeCliente = mensajeCliente.replace(/AVISO_PAGO/g, "").trim();
         console.log("AVISO DE PAGO de", phoneNumber);
       }
+      let enviarFotos = "no";
+      if (mensajeCliente.includes("ENVIAR_FOTOS")) {
+        enviarFotos = "si";
+        mensajeCliente = mensajeCliente.replace(/ENVIAR_FOTOS/g, "").trim();
+        console.log("FOTOS solicitadas por", phoneNumber);
+      }
       if (!mensajeCliente.trim()) mensajeCliente = "Perfecto, ya quedo anotado 😊 ¿Algo mas en lo que te pueda ayudar?";
 
       history.push({ role: "assistant", content: reply });
@@ -216,7 +226,7 @@ app.post("/webhook", (req, res) => {
       db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))",
         [phoneNumber, JSON.stringify(history)]);
 
-      res.json({ response: mensajeCliente, avisoPago });
+      res.json({ response: mensajeCliente, avisoPago, enviarFotos });
     } catch (error) {
       console.error(error);
       res.status(200).json({ response: "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?" });
