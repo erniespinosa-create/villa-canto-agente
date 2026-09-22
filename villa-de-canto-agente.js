@@ -133,7 +133,9 @@ FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo 
 
 CUANDO el cliente confirme que quiere reservar (y ya consultaste disponibilidad y esta libre), agrega al FINAL de tu respuesta, en su propia linea, exactamente esto (el cliente no lo vera):
 RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"..."}
-Solo UNA vez por reserva confirmada.`;
+Solo UNA vez por reserva confirmada.
+
+AVISO DE PAGO: si el cliente dice que ya deposito, ya pago, ya transfirio, o manda su comprobante, agradecele con calidez, dile que en breve confirmamos el pago, y agrega al FINAL de tu respuesta, en su propia linea, exactamente: AVISO_PAGO (el cliente no lo vera).`;
 }
 
 async function responderConClaude(history) {
@@ -197,6 +199,12 @@ app.post("/webhook", (req, res) => {
           console.error("Error creando evento de Calendar:", e.message);
         }
       }
+      let avisoPago = "no";
+      if (mensajeCliente.includes("AVISO_PAGO")) {
+        avisoPago = "si";
+        mensajeCliente = mensajeCliente.replace(/AVISO_PAGO/g, "").trim();
+        console.log("AVISO DE PAGO de", phoneNumber);
+      }
       if (!mensajeCliente.trim()) mensajeCliente = "Perfecto, ya quedo anotado 😊 ¿Algo mas en lo que te pueda ayudar?";
 
       history.push({ role: "assistant", content: reply });
@@ -205,7 +213,7 @@ app.post("/webhook", (req, res) => {
       db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))",
         [phoneNumber, JSON.stringify(history)]);
 
-      res.json({ response: mensajeCliente });
+      res.json({ response: mensajeCliente, avisoPago });
     } catch (error) {
       console.error(error);
       res.status(200).json({ response: "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?" });
