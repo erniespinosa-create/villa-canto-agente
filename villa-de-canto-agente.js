@@ -14,41 +14,55 @@ const auth = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_SECRET,
   "http://localhost:8080/callback"
 );
+if (process.env.GOOGLE_REFRESH_TOKEN) auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 const calendar = google.calendar({ version: "v3", auth });
 const CALENDAR_ID = process.env.CALENDAR_ID;
-if (process.env.GOOGLE_REFRESH_TOKEN) auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 
-async function hayDisponibilidad(llegada, salida) {
-  const [dl, ml, al] = llegada.split("/");
-  const [ds, ms, as] = salida.split("/");
-  const start = new Date(al, ml - 1, dl, 0, 0, 0);
-  const end = new Date(as, ms - 1, ds, 23, 59, 59);
-  const existentes = await calendar.events.list({
-    calendarId: CALENDAR_ID, timeMin: start.toISOString(), timeMax: end.toISOString(),
+function aISO(fecha) {
+  const [d, m, a] = String(fecha).trim().split(/[\/\-\.]/);
+  return `${a}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+}
+
+async function consultarDisponibilidad(llegada, salida) {
+  const r = await calendar.events.list({
+    calendarId: CALENDAR_ID,
+    timeMin: `${aISO(llegada)}T13:00:00-06:00`,
+    timeMax: `${aISO(salida)}T12:00:00-06:00`,
+    singleEvents: true,
   });
-  return !(existentes.data.items && existentes.data.items.length > 0);
+  const ocupados = (r.data.items || []).filter(e => e.status !== "cancelled");
+  return { disponible: ocupados.length === 0 };
 }
 
 async function crearEventoCalendar(datos) {
-  const [dl, ml, al] = datos.llegada.split("/");
-  const [ds, ms, as] = datos.salida.split("/");
-  const start = new Date(al, ml - 1, dl, 13, 0, 0);
-  const end = new Date(as, ms - 1, ds, 12, 0, 0);
-  const existentes = await calendar.events.list({
-    calendarId: CALENDAR_ID, timeMin: start.toISOString(), timeMax: end.toISOString(), q: datos.nombre,
-  });
-  if (existentes.data.items && existentes.data.items.length > 0) return { duplicado: true };
+  const { disponible } = await consultarDisponibilidad(datos.llegada, datos.salida);
+  if (!disponible) return { ocupado: true };
   const evento = await calendar.events.insert({
     calendarId: CALENDAR_ID,
     resource: {
       summary: `Reserva - ${datos.nombre}`,
-      description: `Adultos: ${datos.adultos}\nNinos: ${datos.ninos || 0}\nMotivo: ${datos.motivo || "-"}`,
-      start: { dateTime: start.toISOString(), timeZone: "America/Mexico_City" },
-      end: { dateTime: end.toISOString(), timeZone: "America/Mexico_City" },
+      description: `Adultos: ${datos.adultos}\nNinos: ${datos.ninos || 0}\nMotivo: ${datos.motivo || "-"}\nTelefono: ${datos.telefono || "-"}`,
+      start: { dateTime: `${aISO(datos.llegada)}T13:00:00`, timeZone: "America/Mexico_City" },
+      end: { dateTime: `${aISO(datos.salida)}T12:00:00`, timeZone: "America/Mexico_City" },
     },
   });
-  return { duplicado: false, id: evento.data.id };
+  return { ocupado: false, id: evento.data.id };
 }
+
+const TOOLS = [
+  {
+    name: "consultar_disponibilidad",
+    description: "Revisa en el calendario si la villa esta libre entre la fecha de llegada y la de salida. Usala SIEMPRE en cuanto tengas ambas fechas, antes de cotizar.",
+    input_schema: {
+      type: "object",
+      properties: {
+        llegada: { type: "string", description: "DD/MM/AAAA" },
+        salida: { type: "string", description: "DD/MM/AAAA" },
+      },
+      required: ["llegada", "salida"],
+    },
+  },
+];
 
 const db = new sqlite3.Database(path.join("/tmp", "conversations.db"));
 db.run(`CREATE TABLE IF NOT EXISTS conversations (
@@ -62,15 +76,16 @@ function hoyMexico() {
   return new Date().toLocaleDateString("es-MX", { timeZone: "America/Mexico_City", day: "2-digit", month: "2-digit", year: "numeric", weekday: "long" });
 }
 
-const SYSTEM_PROMPT = `Eres Canto, el asistente de Villa de Canto en Amazcala, El Marques, Queretaro.
+function systemPrompt() {
+  return `Eres Canto, el asistente de Villa de Canto en Amazcala, El Marques, Queretaro.
 
 FECHA DE HOY: ${hoyMexico()} (usa esto para resolver "manana", "el viernes", "este fin de semana", etc. sin preguntar)
 
-FORMATO DE FECHAS: El cliente puede escribir fechas de cualquier forma (22/09/2026, 22-09-2026, "22 de septiembre", "manana", "el viernes que entra"). Acepta y entiende cualquier formato, nunca rechaces una fecha por su formato ni pidas que la repita en un formato especifico.NUNCA INVENTES DATOS: usa solo lo que el cliente escribio literalmente. Si dice "2 adultos" y no menciona ninos, pregunta "¿van ninos?" o asume 0; jamas agregues personas, fechas o motivos que no dijo.
+FORMATO DE FECHAS: El cliente puede escribir fechas de cualquier forma (22/09/2026, 22-09-2026, "22 de septiembre", "manana", "el viernes que entra"). Acepta y entiende cualquier formato, nunca rechaces una fecha por su formato.
 
-FECHAS - CONFIRMA SIEMPRE: cuando el cliente te de una fecha, repitela con el dia de la semana para confirmar (ej: "entonces llegan el sabado 26/09/2026, ¿verdad?"). Si es ambigua, pregunta dia y mes en numeros.
+NUNCA INVENTES DATOS: usa solo lo que el cliente escribio literalmente. Si dice "2 adultos" y no menciona ninos, pregunta "¿van ninos?" o asume 0; jamas agregues personas, fechas o motivos que no dijo.
 
-LONGITUD: estas en WhatsApp. Responde CORTO, maximo 4-6 lineas por mensaje, como una persona. No mandes toda la informacion de golpe; da solo lo que pregunto y ofrece mas si lo quiere.
+DISPONIBILIDAD: en cuanto tengas fecha de llegada y de salida, usa la herramienta consultar_disponibilidad ANTES de cotizar. Si no esta disponible, dilo con calidez y ofrece buscar otras fechas. Nunca digas que hay disponibilidad sin haberla consultado.
 
 DATOS:
 - Capacidad: 15 adultos + 2 ninos maximo
@@ -87,15 +102,16 @@ DISTRIBUCION DE HABITACIONES (5 habitaciones, todas con aire acondicionado):
 
 SERVICIOS: alberca climatizada 33-35C, horno de pizza, asador, gym, area de juegos, estacionamiento 4 autos, limpieza incluida.
 
-PAQUETES ADICIONALES (mejoran la experiencia, se cotizan aparte de la renta):
+PAQUETES ADICIONALES (se cotizan aparte de la renta):
 - Cumpleanos: decoracion del cuarto con globos, pastel con vela de bengala, decoracion de "Feliz Cumpleanos"
 - Hay otros paquetes disponibles (bodas, aniversarios, eventos especiales, etc.)
-Si preguntan por paquetes, confirma que existen y menciona el de cumpleanos como ejemplo. Los precios exactos aun no estan definidos, dilo con naturalidad ("estamos por confirmar el costo de ese paquete, en breve te doy el numero exacto") sin inventar cifras ni remitir a otra persona.
+Si preguntan por paquetes, confirma que existen y menciona el de cumpleanos como ejemplo. Los precios aun no estan definidos: dilo con naturalidad ("estamos por confirmar el costo de ese paquete, en breve te doy el numero exacto") sin inventar cifras ni remitir a otra persona.
 
-TARIFAS POR NOCHE:
+TARIFAS POR NOCHE (cada noche se cobra segun el dia en que se duerme):
 - Lunes a jueves y domingo: $10,500
 - Viernes: $12,000
 - Sabado: $14,000
+Noches = dias entre llegada y salida (llegar martes y salir miercoles = 1 noche, la del martes).
 
 PAGO:
 - Anticipo 50% del total
@@ -104,77 +120,101 @@ PAGO:
 
 REGLAS:
 - No des descuentos
-- No inventes disponibilidad
 - Pide contrato firmado + INE al confirmar
-- Nunca pidas correo electronico; no es necesario para la reserva
+- Nunca pidas correo electronico
 
 TONO: calido, pausado, conversacional. Emojis ocasionales. Nunca robotico.
 
-EXTRACCION DE DATOS: El cliente puede darte varios datos juntos en un solo mensaje (separados por comas, saltos de linea, o mezclados en una frase) o uno por uno en mensajes distintos. Lee TODO el mensaje completo con cuidado antes de responder y extrae cada dato que encuentres (nombre, fechas, adultos, ninos, motivo), sin importar el orden, formato, o si vienen juntos o separados, incluso si van despues de palabras como "nombre completo:" o "correo:". Nunca vuelvas a pedir un dato que el cliente ya te dio en cualquier mensaje anterior de la conversacion, y nunca digas que no lo recibiste si ya esta en el historial. SIEMPRE responde algo despues de recibir cualquier mensaje del cliente, aunque sea solo confirmar el dato recibido (ej: "Perfecto, ya tengo tu nombre completo, [nombre]. Ahora dime..."); nunca dejes un mensaje sin respuesta.
+LONGITUD: estas en WhatsApp. Responde CORTO, maximo 4-6 lineas por mensaje, como una persona. No mandes toda la informacion de golpe; da solo lo que pregunto y ofrece mas si lo quiere.
 
-FECHAS - CONFIRMA SIEMPRE: cuando el cliente te de una fecha, antes de seguir, repitela de vuelta con el dia de la semana para confirmar que la entendiste bien (ej: "entonces llegan el sabado 26/09/2026, ¿verdad?"). Si la fecha es ambigua o no puedes resolverla con certeza, pregunta el dia y mes exactos en numeros.
+EXTRACCION DE DATOS: el cliente puede darte varios datos en un solo mensaje o uno por uno. Lee todo el mensaje y extrae nombre, fechas, adultos, ninos y motivo sin importar el orden o formato. Nunca vuelvas a pedir un dato que ya te dio. SIEMPRE responde algo a cada mensaje.
 
-FLUJO: saluda, pregunta que necesita, recoge nombre/fechas DD-MM-AAAA/adultos/ninos/motivo de forma natural, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide comprobante.
+FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo de forma natural, consulta disponibilidad, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide comprobante.
 
-CUANDO TENGAS nombre, fecha de llegada, fecha de salida y numero de adultos completos y el cliente haya confirmado que quiere reservar, agrega al FINAL de tu respuesta, en su propia linea, exactamente esto (el cliente no lo vera, se procesa aparte):
+CUANDO el cliente confirme que quiere reservar (y ya consultaste disponibilidad y esta libre), agrega al FINAL de tu respuesta, en su propia linea, exactamente esto (el cliente no lo vera):
 RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"..."}
-Solo agrega esa linea UNA vez por reserva confirmada, no la repitas en mensajes posteriores de la misma conversacion.`;
+Solo UNA vez por reserva confirmada.`;
+}
+
+async function responderConClaude(history) {
+  const msgs = history.map(m => ({ role: m.role, content: m.content }));
+  for (let i = 0; i < 4; i++) {
+    const response = await client.messages.create({
+      model: "claude-sonnet-4-5",
+      max_tokens: 450,
+      system: systemPrompt(),
+      tools: TOOLS,
+      messages: msgs,
+    });
+    if (response.stop_reason !== "tool_use") {
+      return response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+    }
+    msgs.push({ role: "assistant", content: response.content });
+    const resultados = [];
+    for (const b of response.content) {
+      if (b.type !== "tool_use") continue;
+      let out;
+      try {
+        out = await consultarDisponibilidad(b.input.llegada, b.input.salida);
+        console.log("Disponibilidad", b.input.llegada, "-", b.input.salida, out.disponible ? "LIBRE" : "OCUPADO");
+      } catch (e) {
+        console.error("Error consultando disponibilidad:", e.message);
+        out = { error: "No se pudo consultar el calendario, dile al cliente que confirmaras la disponibilidad en breve" };
+      }
+      resultados.push({ type: "tool_result", tool_use_id: b.id, content: JSON.stringify(out) });
+    }
+    msgs.push({ role: "user", content: resultados });
+  }
+  return "Dame un momento, estoy revisando la disponibilidad y te confirmo enseguida 😊";
+}
 
 app.get("/", (req, res) => res.json({ status: "ok", agente: "Canto" }));
 
-app.post("/webhook", async (req, res) => {
-  const { phoneNumber, message } = req.body;
+app.post("/webhook", (req, res) => {
+  const { phoneNumber, message } = req.body || {};
   if (!phoneNumber || !message) return res.status(400).json({ error: "phoneNumber y message requeridos" });
 
   db.get("SELECT messages FROM conversations WHERE id = ?", [phoneNumber], async (err, row) => {
     let history = row ? JSON.parse(row.messages) : [];
-    history.push({ role: "user", content: message });
+    history.push({ role: "user", content: String(message) });
 
     try {
-      const response = await client.messages.create({
-        model: "claude-sonnet-4-5",
-        max_tokens: 1024,
-        system: SYSTEM_PROMPT,
-        messages: history,
-      });
-      const reply = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+      const reply = await responderConClaude(history);
       let mensajeCliente = reply;
       const match = reply.match(/RESERVA_JSON:(\{.*\})/);
       if (match) {
         mensajeCliente = reply.replace(match[0], "").trim();
         try {
-          const datosReserva = JSON.parse(match[1]);
-          const libre = await hayDisponibilidad(datosReserva.llegada, datosReserva.salida);
-          if (!libre) {
-            mensajeCliente = mensajeCliente.replace(/\n?$/, "") + "\n\nAy, justo revisé y esas fechas ya estan ocupadas 😔 ¿Quieres que busquemos otras fechas cercanas?";
+          const datos = JSON.parse(match[1]);
+          datos.telefono = phoneNumber;
+          const r = await crearEventoCalendar(datos);
+          if (r.ocupado) {
+            mensajeCliente += "\n\nAy, justo acabo de revisar y esas fechas se acaban de ocupar 😔 ¿Buscamos otras fechas cercanas?";
           } else {
-            const resultado = await crearEventoCalendar(datosReserva);
-            if (resultado.duplicado) console.log("Reserva duplicada, no se creo evento:", datosReserva.nombre);
-            else console.log("Evento creado en Calendar:", resultado.id);
+            console.log("Evento creado en Calendar:", r.id);
           }
         } catch (e) {
           console.error("Error creando evento de Calendar:", e.message);
         }
       }
-      if (!mensajeCliente || !mensajeCliente.trim()) {
-        mensajeCliente = "Perfecto, ya quedo anotado. ¿Algo mas en lo que te pueda ayudar?";
-      }
+      if (!mensajeCliente.trim()) mensajeCliente = "Perfecto, ya quedo anotado 😊 ¿Algo mas en lo que te pueda ayudar?";
+
       history.push({ role: "assistant", content: reply });
       if (history.length > 20) history.splice(0, history.length - 20);
-      
-      db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))", 
+      while (history.length && history[0].role !== "user") history.shift();
+      db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))",
         [phoneNumber, JSON.stringify(history)]);
-      
+
       res.json({ response: mensajeCliente });
     } catch (error) {
       console.error(error);
-      res.status(500).json({ error: error.message });
+      res.status(200).json({ response: "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?" });
     }
   });
 });
 
 app.use((err, req, res, next) => {
-  if (err.type === "entity.parse.failed") return res.status(200).json({ response: "No entendi bien ese mensaje, me lo repites?" });
+  if (err.type === "entity.parse.failed") return res.status(200).json({ response: "No entendí bien ese mensaje, ¿me lo repites?" });
   next(err);
 });
 
