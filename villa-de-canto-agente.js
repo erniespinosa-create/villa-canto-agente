@@ -2,6 +2,8 @@ const Anthropic = require("@anthropic-ai/sdk");
 const { google } = require("googleapis");
 const express = require("express");
 const bodyParser = require("body-parser");
+const sqlite3 = require("sqlite3").verbose();
+const path = require("path");
 
 const app = express();
 app.use(bodyParser.json({ limit: "2mb", strict: false }));
@@ -15,7 +17,13 @@ const auth = new google.auth.OAuth2(
 const calendar = google.calendar({ version: "v3", auth });
 const CALENDAR_ID = process.env.CALENDAR_ID;
 
-const conversations = new Map();
+const db = new sqlite3.Database(path.join("/tmp", "conversations.db"));
+db.run(`CREATE TABLE IF NOT EXISTS conversations (
+  id TEXT PRIMARY KEY,
+  messages TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)`);
 
 function hoyMexico() {
   return new Date().toLocaleDateString("es-MX", { timeZone: "America/Mexico_City", day: "2-digit", month: "2-digit", year: "numeric", weekday: "long" });
@@ -26,8 +34,6 @@ const SYSTEM_PROMPT = `Eres Canto, el asistente de Villa de Canto en Amazcala, E
 FECHA DE HOY: ${hoyMexico()} (usa esto para resolver "manana", "el viernes", "este fin de semana", etc. sin preguntar)
 
 FORMATO DE FECHAS: El cliente puede escribir fechas de cualquier forma (22/09/2026, 22-09-2026, "22 de septiembre", "manana", "el viernes que entra"). Acepta y entiende cualquier formato, nunca rechaces una fecha por su formato ni pidas que la repita en un formato especifico.
-EXTRACCION DE DATOS: El cliente puede darte varios datos juntos en un solo mensaje (separados por comas, saltos de linea, o mezclados en una frase) o uno por uno en mensajes distintos. Lee TODO el mensaje completo con cuidado antes de responder y extrae cada dato que encuentres (nombre, fechas, adultos, ninos, motivo, correo), sin importar el orden o si vienen juntos o separados. Nunca vuelvas a pedir un dato que el cliente ya te dio en cualquier mensaje anterior de la conversacion.
-
 
 DATOS:
 - Capacidad: 15 adultos + 2 ninos maximo
@@ -54,7 +60,7 @@ REGLAS:
 
 TONO: calido, pausado, conversacional. Emojis ocasionales. Nunca robotico.
 
-FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo/correo de forma natural, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide comprobante.`;
+FLUJO: saluda, pregunta que necesita, recoge nombre/fechas DD-MM-AAAA/adultos/ninos/motivo/correo de forma natural, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide comprobante.`;
 
 app.get("/", (req, res) => res.json({ status: "ok", agente: "Canto" }));
 
@@ -62,25 +68,30 @@ app.post("/webhook", async (req, res) => {
   const { phoneNumber, message } = req.body;
   if (!phoneNumber || !message) return res.status(400).json({ error: "phoneNumber y message requeridos" });
 
-  if (!conversations.has(phoneNumber)) conversations.set(phoneNumber, []);
-  const history = conversations.get(phoneNumber);
-  history.push({ role: "user", content: message });
+  db.get("SELECT messages FROM conversations WHERE id = ?", [phoneNumber], async (err, row) => {
+    let history = row ? JSON.parse(row.messages) : [];
+    history.push({ role: "user", content: message });
 
-  try {
-    const response = await client.messages.create({
-      model: "claude-sonnet-5",
-      max_tokens: 1024,
-      system: SYSTEM_PROMPT,
-      messages: history,
-    });
-    const reply = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
-    history.push({ role: "assistant", content: reply });
-    if (history.length > 20) history.splice(0, history.length - 20);
-    res.json({ response: reply });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
-  }
+    try {
+      const response = await client.messages.create({
+        model: "claude-sonnet-5",
+        max_tokens: 1024,
+        system: SYSTEM_PROMPT,
+        messages: history,
+      });
+      const reply = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+      history.push({ role: "assistant", content: reply });
+      if (history.length > 20) history.splice(0, history.length - 20);
+      
+      db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))", 
+        [phoneNumber, JSON.stringify(history)]);
+      
+      res.json({ response: reply });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: error.message });
+    }
+  });
 });
 
 app.use((err, req, res, next) => {
