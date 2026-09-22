@@ -1,4 +1,4 @@
-const Anthropic = require("@anthropic-ai/sdk");
+onst Anthropic = require("@anthropic-ai/sdk");
 const { google } = require("googleapis");
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -40,13 +40,37 @@ async function crearEventoCalendar(datos) {
   const evento = await calendar.events.insert({
     calendarId: CALENDAR_ID,
     resource: {
-      summary: `Reserva - ${datos.nombre}`,
+      summary: `⏳ PENDIENTE - ${datos.nombre}`,
+      colorId: "5",
+      extendedProperties: { private: { telefono: String(datos.telefono || ""), estado: "pendiente" } },
       description: `Adultos: ${datos.adultos}\nNinos: ${datos.ninos || 0}\nMotivo: ${datos.motivo || "-"}\nTelefono: ${datos.telefono || "-"}`,
       start: { dateTime: `${aISO(datos.llegada)}T13:00:00`, timeZone: "America/Mexico_City" },
       end: { dateTime: `${aISO(datos.salida)}T12:00:00`, timeZone: "America/Mexico_City" },
     },
   });
   return { ocupado: false, id: evento.data.id };
+}
+
+async function confirmarReservas(telefono) {
+  const r = await calendar.events.list({
+    calendarId: CALENDAR_ID,
+    privateExtendedProperty: [`telefono=${telefono}`, "estado=pendiente"],
+    singleEvents: true,
+  });
+  const pendientes = (r.data.items || []).filter(e => e.status !== "cancelled");
+  for (const e of pendientes) {
+    await calendar.events.patch({
+      calendarId: CALENDAR_ID,
+      eventId: e.id,
+      resource: {
+        summary: e.summary.replace("⏳ PENDIENTE", "✅ CONFIRMADA"),
+        colorId: "10",
+        extendedProperties: { private: { telefono: String(telefono), estado: "confirmada" } },
+      },
+    });
+    console.log("Reserva confirmada en Calendar:", e.id);
+  }
+  return pendientes.length;
 }
 
 const TOOLS = [
@@ -188,6 +212,14 @@ app.post("/webhook", (req, res) => {
     history.push({ role: "user", content: String(message) });
 
     try {
+      if (String(message).startsWith("[SISTEMA] PAGO_CONFIRMADO")) {
+        try {
+          const n = await confirmarReservas(phoneNumber);
+          if (n === 0) console.log("No habia reservas pendientes para", phoneNumber);
+        } catch (e) {
+          console.error("Error confirmando reserva en Calendar:", e.message);
+        }
+      }
       const reply = await responderConClaude(history);
       let mensajeCliente = reply;
       const match = reply.match(/RESERVA_JSON:(\{.*\})/);
