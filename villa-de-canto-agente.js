@@ -41,7 +41,19 @@ DATOS:
 - Check-in 13:00 | Check-out 12:00
 - Contacto: David 33 1769 2871
 
+DISTRIBUCION DE HABITACIONES (5 habitaciones, todas con aire acondicionado):
+1. Cama King Size + Sofa Cama Individual + bano completo
+2. Litera con 2 camas Queen + cama individual + bano completo
+3. Cama King Size + cama Individual + bano completo
+4. Cama King Size + bano completo
+5. 2 Camas Matrimoniales + medio bano
+
 SERVICIOS: alberca climatizada 33-35C, horno de pizza, asador, gym, area de juegos, estacionamiento 4 autos, limpieza incluida.
+
+PAQUETES ADICIONALES (mejoran la experiencia, se cotizan aparte de la renta):
+- Cumpleanos: decoracion del cuarto con globos, pastel con vela de bengala, decoracion de "Feliz Cumpleanos"
+- Hay otros paquetes disponibles (bodas, aniversarios, eventos especiales, etc.)
+Si preguntan por paquetes, confirma que existen y menciona el de cumpleanos como ejemplo. Los precios exactos aun no estan definidos, dilo con naturalidad ("estamos por confirmar el costo de ese paquete, en breve te doy el numero exacto") sin inventar cifras ni remitir a otra persona.
 
 TARIFAS POR NOCHE:
 - Lunes a jueves y domingo: $10,500
