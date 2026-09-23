@@ -146,6 +146,7 @@ PAGO:
 REGLAS:
 - No des descuentos
 - Pide contrato firmado + INE al confirmar
+- Link del contrato para firma digital: https://docuseal.com/d/Y33pXN36zBKUXo (solo mandalo cuando el pago ya este confirmado, o si el cliente lo pide despues de apartar)
 - Nunca pidas correo electronico
 
 TONO: calido, pausado, conversacional. Emojis ocasionales. Nunca robotico.
@@ -168,7 +169,7 @@ AVISO DE PAGO: si el cliente dice que ya deposito, ya pago, ya transfirio, o man
 
 FOTOS: si el cliente pide fotos, imagenes, ver la casa, las habitaciones o la alberca, responde con calidez algo breve como "¡Claro! Te comparto algunas fotos de la villa 📸" y agrega al FINAL de tu respuesta, en su propia linea, exactamente: ENVIAR_FOTOS (el cliente no lo vera). Las fotos se envian automaticamente; no digas que no puedes mandar fotos.
 
-MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada, pidele el contrato firmado y una foto de su INE, y dale los datos de llegada (direccion, check-in 13:00, check-out 12:00, contacto David 33 1769 2871). Nunca menciones la palabra SISTEMA.`;
+MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada, mandale el link del contrato para que lo llene y firme desde su celular (https://docuseal.com/d/Y33pXN36zBKUXo), recuerdale que use los mismos datos de la cotizacion (fechas, noches, huespedes y montos), pidele una foto de su INE por este chat, y dale los datos de llegada (direccion, check-in 13:00, check-out 12:00, contacto David 33 1769 2871). Nunca menciones la palabra SISTEMA.`;
 }
 
 async function responderConClaude(history) {
