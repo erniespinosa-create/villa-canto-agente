@@ -18,6 +18,7 @@ if (process.env.GOOGLE_REFRESH_TOKEN) auth.setCredentials({ refresh_token: proce
 const calendar = google.calendar({ version: "v3", auth });
 const CALENDAR_ID = process.env.CALENDAR_ID;
 
+// "22/09/2026" o "22-09-2026" -> "2026-09-22"
 function aISO(fecha) {
   const [d, m, a] = String(fecha).trim().split(/[\/\-\.]/);
   return `${a}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
@@ -72,6 +73,7 @@ async function confirmarReservas(telefono) {
   }
   return pendientes.length;
 }
+
 const TOOLS = [
   {
     name: "consultar_disponibilidad",
@@ -98,6 +100,7 @@ db.run(`CREATE TABLE IF NOT EXISTS conversations (
 function hoyMexico() {
   return new Date().toLocaleDateString("es-MX", { timeZone: "America/Mexico_City", day: "2-digit", month: "2-digit", year: "numeric", weekday: "long" });
 }
+
 function systemPrompt() {
   return `Eres Canto, el asistente de Villa de Canto en Amazcala, El Marques, Queretaro.
 
@@ -165,7 +168,6 @@ FOTOS: si el cliente pide fotos, imagenes, ver la casa, las habitaciones o la al
 
 MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada, pidele el contrato firmado y una foto de su INE, y dale los datos de llegada (direccion, check-in 13:00, check-out 12:00, contacto David 33 1769 2871). Nunca menciones la palabra SISTEMA.`;
 }
-PARTE 4 de 4: Claude y webhook
 
 async function responderConClaude(history) {
   const msgs = history.map(m => ({ role: m.role, content: m.content }));
