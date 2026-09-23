@@ -42,7 +42,7 @@ async function crearEventoCalendar(datos) {
     calendarId: CALENDAR_ID,
     resource: {
       summary: `⏳ PENDIENTE - ${datos.nombre}`,
-      colorId: "5",
+      colorId: "8",
       extendedProperties: { private: { telefono: String(datos.telefono || ""), estado: "pendiente" } },
       description: `Adultos: ${datos.adultos}\nNinos: ${datos.ninos || 0}\nMotivo: ${datos.motivo || "-"}\nTelefono: ${datos.telefono || "-"}`,
       start: { dateTime: `${aISO(datos.llegada)}T13:00:00`, timeZone: "America/Mexico_City" },
@@ -65,7 +65,7 @@ async function confirmarReservas(telefono) {
       eventId: e.id,
       resource: {
         summary: e.summary.replace("⏳ PENDIENTE", "✅ CONFIRMADA"),
-        colorId: "10",
+        colorId: "5",
         extendedProperties: { private: { telefono: String(telefono), estado: "confirmada" } },
       },
     });
@@ -280,4 +280,9 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Agente Canto en puerto ${PORT}`));
+const server = app.listen(PORT, () => console.log(`Agente Canto en puerto ${PORT}`));
+process.on("SIGTERM", () => {
+  console.log("Apagando para nueva version...");
+  server.close(() => db.close(() => process.exit(0)));
+  setTimeout(() => process.exit(0), 5000);
+});
