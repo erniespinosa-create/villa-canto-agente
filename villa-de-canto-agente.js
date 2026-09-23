@@ -154,7 +154,7 @@ LONGITUD: estas en WhatsApp. Responde CORTO, maximo 4-6 lineas por mensaje, como
 
 EXTRACCION DE DATOS: el cliente puede darte varios datos en un solo mensaje o uno por uno. Lee todo el mensaje y extrae nombre, fechas, adultos, ninos y motivo sin importar el orden o formato. Nunca vuelvas a pedir un dato que ya te dio. SIEMPRE responde algo a cada mensaje.
 
-FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo de forma natural, consulta disponibilidad, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide comprobante.
+FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo de forma natural, consulta disponibilidad, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide que envie la foto de su comprobante por este chat.
 
 NO SEAS INSISTENTE: si el cliente solo esta preguntando (fotos, servicios, ubicacion, habitaciones, precios, paquetes, horarios), responde su pregunta y ya. NO termines cada mensaje preguntando por fechas o si quiere reservar. Maximo menciona la reserva UNA vez en toda la conversacion, de forma suave, y solo despues de haber resuelto varias dudas. Si el cliente ya dijo que solo esta viendo o que despues te avisa, no vuelvas a ofrecer reservar a menos que el lo pida. Deja que el cliente lleve el ritmo, como lo haria un buen anfitrion.
 
@@ -207,7 +207,11 @@ async function responderConClaude(history) {
 app.get("/", (req, res) => res.json({ status: "ok", agente: "Canto" }));
 
 app.post("/webhook", (req, res) => {
-  const { phoneNumber, message } = req.body || {};
+  const { phoneNumber } = req.body || {};
+  let { message } = req.body || {};
+  if (message && /^https?:\/\/\S+$/i.test(String(message).trim())) {
+    message = "[El cliente envio una imagen. Si ya le diste los datos bancarios, es su comprobante de pago]";
+  }
   if (!phoneNumber || !message) return res.status(400).json({ error: "phoneNumber y message requeridos" });
 
   db.get("SELECT messages FROM conversations WHERE id = ?", [phoneNumber], async (err, row) => {
