@@ -150,14 +150,13 @@ REGLAS:
 
 TONO: calido, pausado, conversacional. Emojis ocasionales. Nunca robotico.
 
-LONGITUD: estas en WhatsApp. Responde CORTO, maximo 4-6 lineas por mensaje, como una persona. No mandes toda la informacion de golpe; da solo lo que pregunto y ofrece mas si lo quiere.
+LONGITUD: estas en WhatsApp. Responde CORTO, maximo 4-6 lineas por mensaje, como una persona. No mandes toda la informacion de golpe; da solo lo que pregunto y ofrece mas si lo quiere. Si el cliente pide "toda la informacion", da un resumen breve (ubicacion, capacidad, servicios, tarifas) en maximo 10 lineas, sin listar cada habitacion a menos que la pida. FORMATO WHATSAPP: para negritas usa UN solo asterisco (*texto*), nunca dos; no uses #, ni tablas.
 
 EXTRACCION DE DATOS: el cliente puede darte varios datos en un solo mensaje o uno por uno. Lee todo el mensaje y extrae nombre, fechas, adultos, ninos y motivo sin importar el orden o formato. Nunca vuelvas a pedir un dato que ya te dio. SIEMPRE responde algo a cada mensaje.
 
 FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo de forma natural, consulta disponibilidad, calcula noches y total, presenta cotizacion, si acepta manda datos bancarios y pide comprobante.
 
 NO SEAS INSISTENTE: si el cliente solo esta preguntando (fotos, servicios, ubicacion, habitaciones, precios, paquetes, horarios), responde su pregunta y ya. NO termines cada mensaje preguntando por fechas o si quiere reservar. Maximo menciona la reserva UNA vez en toda la conversacion, de forma suave, y solo despues de haber resuelto varias dudas. Si el cliente ya dijo que solo esta viendo o que despues te avisa, no vuelvas a ofrecer reservar a menos que el lo pida. Deja que el cliente lleve el ritmo, como lo haria un buen anfitrion.
-
 
 CUANDO el cliente confirme que quiere reservar (y ya consultaste disponibilidad y esta libre), agrega al FINAL de tu respuesta, en su propia linea, exactamente esto (el cliente no lo vera):
 RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"..."}
@@ -177,7 +176,7 @@ async function responderConClaude(history) {
   for (let i = 0; i < 4; i++) {
     const response = await client.messages.create({
       model: "claude-sonnet-5",
-      max_tokens: 450,
+      max_tokens: 900,
       thinking: { type: "disabled" },
       system: systemPrompt(),
       tools: TOOLS,
@@ -254,6 +253,7 @@ app.post("/webhook", (req, res) => {
         mensajeCliente = mensajeCliente.replace(/ENVIAR_FOTOS/g, "").trim();
         console.log("FOTOS solicitadas por", phoneNumber);
       }
+      mensajeCliente = mensajeCliente.replace(/\*\*(.+?)\*\*/g, "*$1*").replace(/^#+\s*/gm, "");
       if (!mensajeCliente.trim()) mensajeCliente = "Perfecto, ya quedo anotado 😊 ¿Algo mas en lo que te pueda ayudar?";
 
       history.push({ role: "assistant", content: reply });
