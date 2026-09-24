@@ -1,3 +1,16 @@
+{
+  "phoneNumber": "{{Id de contacto}}",
+  "message": "{{last_text_input}}",
+  "telefono": "{{Teléfono}}"
+}
+Deja los datos que ya tenías en phoneNumber y message como están; solo agregas la línea telefono. Luego Guardar → Publicar.
+
+Si falta el teléfono, el agente no falla: usa el Id como antes. En la próxima reserva de prueba debe aparecer tu número completo, por ejemplo 521442....
+
+Edited villa-de-canto-agente.js
+pasamelo completo para copiarlo todo
+Aquí está el código completo. En GitHub abre villa-de-canto-agente.js, da clic en el lápiz ✏️, selecciona todo con Ctrl+A, bórralo, pega esto y da Commit changes:
+
 const Anthropic = require("@anthropic-ai/sdk");
 const { google } = require("googleapis");
 const express = require("express");
@@ -36,6 +49,7 @@ async function consultarDisponibilidad(llegada, salida) {
 }
 
 async function crearEventoCalendar(datos) {
+  if (Number(datos.adultos) > 15 || Number(datos.ninos || 0) > 2) return { excedido: true };
   const { disponible } = await consultarDisponibilidad(datos.llegada, datos.salida);
   if (!disponible) return { ocupado: true };
   const evento = await calendar.events.insert({
@@ -43,7 +57,7 @@ async function crearEventoCalendar(datos) {
     resource: {
       summary: `⏳ PENDIENTE - ${datos.nombre}`,
       colorId: "8",
-      extendedProperties: { private: { telefono: String(datos.telefono || ""), estado: "pendiente" } },
+      extendedProperties: { private: { contacto: String(datos.contacto || ""), telefono: String(datos.telefono || ""), estado: "pendiente" } },
       description: `Adultos: ${datos.adultos}\nNinos: ${datos.ninos || 0}\nMotivo: ${datos.motivo || "-"}\nTelefono: ${datos.telefono || "-"}`,
       start: { dateTime: `${aISO(datos.llegada)}T13:00:00`, timeZone: "America/Mexico_City" },
       end: { dateTime: `${aISO(datos.salida)}T12:00:00`, timeZone: "America/Mexico_City" },
@@ -52,10 +66,10 @@ async function crearEventoCalendar(datos) {
   return { ocupado: false, id: evento.data.id };
 }
 
-async function confirmarReservas(telefono) {
+async function confirmarReservas(contacto) {
   const r = await calendar.events.list({
     calendarId: CALENDAR_ID,
-    privateExtendedProperty: [`telefono=${telefono}`, "estado=pendiente"],
+    privateExtendedProperty: [`contacto=${contacto}`, "estado=pendiente"],
     singleEvents: true,
   });
   const pendientes = (r.data.items || []).filter(e => e.status !== "cancelled");
@@ -66,7 +80,7 @@ async function confirmarReservas(telefono) {
       resource: {
         summary: e.summary.replace("⏳ PENDIENTE", "✅ CONFIRMADA"),
         colorId: "5",
-        extendedProperties: { private: { telefono: String(telefono), estado: "confirmada" } },
+        extendedProperties: { private: { ...(e.extendedProperties?.private || {}), estado: "confirmada" } },
       },
     });
     console.log("Reserva confirmada en Calendar:", e.id);
@@ -113,7 +127,7 @@ NUNCA INVENTES DATOS: usa solo lo que el cliente escribio literalmente. Si dice 
 DISPONIBILIDAD: en cuanto tengas fecha de llegada y de salida, usa la herramienta consultar_disponibilidad ANTES de cotizar. Si no esta disponible, dilo con calidez y ofrece buscar otras fechas. Nunca digas que hay disponibilidad sin haberla consultado.
 
 DATOS:
-- Capacidad: 15 adultos + 2 ninos maximo
+- Capacidad: 15 adultos + 2 ninos maximo (17 personas en total). ES UN LIMITE ESTRICTO: si el cliente pide mas adultos o mas ninos, dile con calidez que la capacidad maxima es de 15 adultos y 2 ninos, y pregunta si pueden ajustar el grupo. Nunca cotices ni apartes por encima de ese limite.
 - Direccion: Boulevard Rodolfo Gaona 106, Campestre Amazcala
 - Check-in 13:00 | Check-out 12:00
 - Contacto: David 33 1769 2871
@@ -208,7 +222,7 @@ async function responderConClaude(history) {
 app.get("/", (req, res) => res.json({ status: "ok", agente: "Canto" }));
 
 app.post("/webhook", (req, res) => {
-  const { phoneNumber } = req.body || {};
+  const { phoneNumber, telefono } = req.body || {};
   let { message } = req.body || {};
   if (message && /^https?:\/\/\S+$/i.test(String(message).trim())) {
     message = "[El cliente envio una imagen. Si ya le diste los datos bancarios, es su comprobante de pago]";
@@ -235,9 +249,12 @@ app.post("/webhook", (req, res) => {
         mensajeCliente = reply.replace(match[0], "").trim();
         try {
           const datos = JSON.parse(match[1]);
-          datos.telefono = phoneNumber;
+          datos.contacto = phoneNumber;
+          datos.telefono = (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber;
           const r = await crearEventoCalendar(datos);
-          if (r.ocupado) {
+          if (r.excedido) {
+            mensajeCliente += "\n\nAntes de apartar, una aclaracion 🙏 la villa tiene capacidad maxima de 15 adultos y 2 ninos. ¿Podemos ajustar el numero de personas?";
+          } else if (r.ocupado) {
             mensajeCliente += "\n\nAy, justo acabo de revisar y esas fechas se acaban de ocupar 😔 ¿Buscamos otras fechas cercanas?";
           } else {
             console.log("Evento creado en Calendar:", r.id);
