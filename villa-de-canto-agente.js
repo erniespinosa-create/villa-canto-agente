@@ -1,16 +1,3 @@
-{
-  "phoneNumber": "{{Id de contacto}}",
-  "message": "{{last_text_input}}",
-  "telefono": "{{Teléfono}}"
-}
-Deja los datos que ya tenías en phoneNumber y message como están; solo agregas la línea telefono. Luego Guardar → Publicar.
-
-Si falta el teléfono, el agente no falla: usa el Id como antes. En la próxima reserva de prueba debe aparecer tu número completo, por ejemplo 521442....
-
-Edited villa-de-canto-agente.js
-pasamelo completo para copiarlo todo
-Aquí está el código completo. En GitHub abre villa-de-canto-agente.js, da clic en el lápiz ✏️, selecciona todo con Ctrl+A, bórralo, pega esto y da Commit changes:
-
 const Anthropic = require("@anthropic-ai/sdk");
 const { google } = require("googleapis");
 const express = require("express");
