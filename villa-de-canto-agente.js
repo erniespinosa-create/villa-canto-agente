@@ -144,7 +144,27 @@ const TOOLS = [
       required: ["llegada", "salida"],
     },
   },
+  {
+    name: "consultar_mis_reservas",
+    description: "Devuelve las reservas vigentes de ESTE cliente segun el calendario real. Usala siempre que el cliente mencione su reserva, su pago, o antes de decir que ya tiene algo apartado.",
+    input_schema: { type: "object", properties: {} },
+  },
 ];
+
+async function reservasDelCliente(contacto) {
+  const r = await calendar.events.list({
+    calendarId: CALENDAR_ID,
+    privateExtendedProperty: [`contacto=${contacto}`],
+    timeMin: new Date(Date.now() - 86400000).toISOString(),
+    singleEvents: true,
+  });
+  const fmt = s => (s || "").slice(0, 10).split("-").reverse().join("/");
+  return (r.data.items || []).filter(e => e.status !== "cancelled").map(e => ({
+    llegada: fmt(e.start.dateTime || e.start.date),
+    salida: fmt(e.end.dateTime || e.end.date),
+    estado: e.extendedProperties?.private?.estado || "pendiente",
+  }));
+}
 
 const db = new sqlite3.Database(path.join(process.env.DB_DIR || "/tmp", "conversations.db"));
 db.run(`CREATE TABLE IF NOT EXISTS conversations (
@@ -220,6 +240,8 @@ CUANDO el cliente confirme que quiere reservar (y ya consultaste disponibilidad 
 RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"...","total":N}
 Solo UNA vez por cada reserva confirmada (no la repitas si solo estan platicando de la misma reserva).
 
+EL CALENDARIO MANDA: lo que se hablo antes en esta conversacion puede estar desactualizado (el administrador puede cancelar o borrar reservas). Antes de decir que el cliente ya tiene una reserva, o si pregunta por su reserva o su pago, usa consultar_mis_reservas y confia SOLO en ese resultado. Si ahi no aparece, NO la tiene: tratala como reserva nueva (consulta disponibilidad, cotiza y genera un nuevo RESERVA_JSON cuando confirme). Nunca digas "ya la tenemos registrada" sin haberlo consultado.
+
 VARIAS RESERVAS: un mismo cliente puede hacer mas de una reserva. Si dice que quiere una reserva NUEVA u OTRA, o da fechas distintas a las de una reserva anterior, tratala como reserva nueva: pregunta las fechas y datos que falten (puedes reutilizar su nombre), consulta disponibilidad, cotiza y, cuando confirme, agrega un NUEVO RESERVA_JSON con las nuevas fechas. Nunca digas "ya la tenemos registrada" si las fechas son distintas.
 
 AVISO DE PAGO: si el cliente dice que ya deposito, ya pago, ya transfirio, o manda su comprobante, agradecele con calidez, dile que en breve confirmamos el pago, y agrega al FINAL de tu respuesta, en su propia linea, exactamente: AVISO_PAGO (el cliente no lo vera).
@@ -229,7 +251,7 @@ FOTOS: si el cliente pide fotos, imagenes, ver la casa, las habitaciones o la al
 MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada, mandale el link del contrato para que lo llene y firme desde su celular (https://docuseal.com/d/Y33pXN36zBKUXo), recuerdale que use los mismos datos de la cotizacion (fechas, noches, huespedes y montos), pidele una foto de su INE por este chat, y dale los datos de llegada (direccion, check-in 13:00, check-out 12:00, contacto David 33 1769 2871). Nunca menciones la palabra SISTEMA.`;
 }
 
-async function responderConClaude(history) {
+async function responderConClaude(history, contacto) {
   const msgs = history.map(m => ({ role: m.role, content: m.content }));
   for (let i = 0; i < 4; i++) {
     const response = await client.messages.create({
@@ -249,8 +271,14 @@ async function responderConClaude(history) {
       if (b.type !== "tool_use") continue;
       let out;
       try {
-        out = await consultarDisponibilidad(b.input.llegada, b.input.salida);
-        console.log("Disponibilidad", b.input.llegada, "-", b.input.salida, out.disponible ? "LIBRE" : "OCUPADO");
+        if (b.name === "consultar_mis_reservas") {
+          const lista = await reservasDelCliente(contacto);
+          out = { reservas: lista, nota: lista.length ? "Estas son sus unicas reservas vigentes" : "No tiene reservas vigentes (si hablaron de una antes, fue cancelada)" };
+          console.log("Reservas de", contacto, ":", lista.length);
+        } else {
+          out = await consultarDisponibilidad(b.input.llegada, b.input.salida);
+          console.log("Disponibilidad", b.input.llegada, "-", b.input.salida, out.disponible ? "LIBRE" : "OCUPADO");
+        }
       } catch (e) {
         console.error("Error consultando disponibilidad:", e.message);
         out = { error: "No se pudo consultar el calendario, dile al cliente que confirmaras la disponibilidad en breve" };
@@ -300,7 +328,7 @@ app.post("/webhook", (req, res) => {
           console.error("Error confirmando reserva en Calendar:", e.message);
         }
       }
-      const reply = await responderConClaude(history);
+      const reply = await responderConClaude(history, phoneNumber);
       let mensajeCliente = reply;
       const match = reply.match(/RESERVA_JSON:(\{.*\})/);
       if (match) {
