@@ -17,6 +17,24 @@ const auth = new google.auth.OAuth2(
 if (process.env.GOOGLE_REFRESH_TOKEN) auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 const calendar = google.calendar({ version: "v3", auth });
 const CALENDAR_ID = process.env.CALENDAR_ID;
+const sheets = google.sheets({ version: "v4", auth });
+const SHEET_ID = process.env.SHEET_ID;
+
+// Bitacora: agrega un renglon a la hoja "Reservas" de Google Sheets
+async function bitacora(estado, d) {
+  if (!SHEET_ID) return;
+  try {
+    const hoy = new Date().toLocaleString("es-MX", { timeZone: "America/Mexico_City" });
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: "Reservas!A:K",
+      valueInputOption: "USER_ENTERED",
+      resource: { values: [[hoy, estado, d.nombre || "", d.telefono || "", d.llegada || "", d.salida || "", d.adultos ?? "", d.ninos ?? "", d.motivo || "", d.total ?? "", d.eventoId || ""]] },
+    });
+  } catch (e) {
+    console.error("Bitacora:", e.message);
+  }
+}
 
 // "22/09/2026" o "22-09-2026" -> "2026-09-22"
 function aISO(fecha) {
@@ -70,9 +88,47 @@ async function confirmarReservas(contacto) {
         extendedProperties: { private: { ...(e.extendedProperties?.private || {}), estado: "confirmada" } },
       },
     });
+    const p = e.extendedProperties?.private || {};
+    const fmt = s => (s || "").slice(0, 10).split("-").reverse().join("/");
+    await bitacora("Confirmada", { nombre: e.summary.replace(/^.*?-\s*/, ""), telefono: p.telefono, llegada: fmt(e.start.dateTime || e.start.date), salida: fmt(e.end.dateTime || e.end.date), eventoId: e.id });
     console.log("Reserva confirmada en Calendar:", e.id);
   }
   return pendientes.length;
+}
+
+// Mensaje post-estancia: 24 h despues del check-out dispara un flujo de ManyChat (plantilla de WhatsApp)
+async function enviarPostEstancia() {
+  if (!process.env.MANYCHAT_API_KEY || !process.env.MANYCHAT_FLOW_RESENA) return;
+  const ahora = Date.now();
+  const r = await calendar.events.list({
+    calendarId: CALENDAR_ID,
+    timeMin: new Date(ahora - 5 * 86400000).toISOString(),
+    timeMax: new Date(ahora - 86400000).toISOString(),
+    privateExtendedProperty: ["estado=confirmada"],
+    singleEvents: true,
+  });
+  for (const e of r.data.items || []) {
+    const p = e.extendedProperties?.private || {};
+    const fin = new Date(e.end.dateTime || e.end.date).getTime();
+    if (p.resena === "enviada" || !p.contacto || ahora - fin < 86400000) continue;
+    try {
+      const resp = await fetch("https://api.manychat.com/fb/sending/sendFlow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.MANYCHAT_API_KEY}` },
+        body: JSON.stringify({ subscriber_id: p.contacto, flow_ns: process.env.MANYCHAT_FLOW_RESENA }),
+      });
+      const data = await resp.json();
+      if (data.status !== "success") { console.error("ManyChat post-estancia:", JSON.stringify(data)); continue; }
+      await calendar.events.patch({
+        calendarId: CALENDAR_ID,
+        eventId: e.id,
+        resource: { extendedProperties: { private: { ...p, resena: "enviada" } } },
+      });
+      console.log("Mensaje post-estancia enviado:", e.summary);
+    } catch (err) {
+      console.error("Error post-estancia:", err.message);
+    }
+  }
 }
 
 const TOOLS = [
@@ -161,7 +217,7 @@ FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo 
 NO SEAS INSISTENTE: si el cliente solo esta preguntando (fotos, servicios, ubicacion, habitaciones, precios, paquetes, horarios), responde su pregunta y ya. NO termines cada mensaje preguntando por fechas o si quiere reservar. Maximo menciona la reserva UNA vez en toda la conversacion, de forma suave, y solo despues de haber resuelto varias dudas. Si el cliente ya dijo que solo esta viendo o que despues te avisa, no vuelvas a ofrecer reservar a menos que el lo pida. Deja que el cliente lleve el ritmo, como lo haria un buen anfitrion.
 
 CUANDO el cliente confirme que quiere reservar (y ya consultaste disponibilidad y esta libre), agrega al FINAL de tu respuesta, en su propia linea, exactamente esto (el cliente no lo vera):
-RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"..."}
+RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"...","total":N}
 Solo UNA vez por cada reserva confirmada (no la repitas si solo estan platicando de la misma reserva).
 
 VARIAS RESERVAS: un mismo cliente puede hacer mas de una reserva. Si dice que quiere una reserva NUEVA u OTRA, o da fechas distintas a las de una reserva anterior, tratala como reserva nueva: pregunta las fechas y datos que falten (puedes reutilizar su nombre), consulta disponibilidad, cotiza y, cuando confirme, agrega un NUEVO RESERVA_JSON con las nuevas fechas. Nunca digas "ya la tenemos registrada" si las fechas son distintas.
@@ -208,6 +264,21 @@ async function responderConClaude(history) {
 
 app.get("/", (req, res) => res.json({ status: "ok", agente: "Canto" }));
 
+app.get("/privacidad", (req, res) => res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aviso de privacidad - Villa de Canto</title></head>
+<body style="font-family:Arial,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#201e1d">
+<h1>Aviso de privacidad</h1>
+<p><b>Villa de Canto</b>, Boulevard Rodolfo Gaona 106, Campestre Amazcala, El Marqués, Querétaro, es responsable del tratamiento de los datos personales que nos compartes por WhatsApp.</p>
+<h2>Datos que recabamos</h2>
+<p>Nombre, teléfono, fechas de estancia, número de huéspedes, motivo de la visita, comprobante de pago e identificación oficial.</p>
+<h2>Para qué los usamos</h2>
+<p>Únicamente para cotizar, apartar y administrar tu reservación, emitir el contrato de arrendamiento y comunicarnos contigo sobre tu estancia. Tu reservación se registra en nuestro calendario y bitácora internos de Google.</p>
+<h2>Con quién los compartimos</h2>
+<p>No vendemos ni compartimos tus datos con terceros, salvo los proveedores tecnológicos necesarios para operar el servicio (WhatsApp, Google y el servicio de firma digital) o cuando la ley lo requiera.</p>
+<h2>Tus derechos</h2>
+<p>Puedes solicitar el acceso, rectificación, cancelación u oposición al uso de tus datos (derechos ARCO) escribiéndonos por WhatsApp.</p>
+<p style="color:#666">Última actualización: septiembre 2026</p>
+</body></html>`));
+
 app.post("/webhook", (req, res) => {
   const { phoneNumber, telefono } = req.body || {};
   let { message } = req.body || {};
@@ -245,6 +316,7 @@ app.post("/webhook", (req, res) => {
             mensajeCliente += "\n\nAy, justo acabo de revisar y esas fechas se acaban de ocupar 😔 ¿Buscamos otras fechas cercanas?";
           } else {
             console.log("Evento creado en Calendar:", r.id);
+            await bitacora("Pendiente de pago", { ...datos, eventoId: r.id });
           }
         } catch (e) {
           console.error("Error creando evento de Calendar:", e.message);
@@ -255,6 +327,7 @@ app.post("/webhook", (req, res) => {
         avisoPago = "si";
         mensajeCliente = mensajeCliente.replace(/AVISO_PAGO/g, "").trim();
         console.log("AVISO DE PAGO de", phoneNumber);
+        await bitacora("Aviso de pago", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber });
       }
       let enviarFotos = "no";
       if (mensajeCliente.includes("ENVIAR_FOTOS")) {
@@ -286,6 +359,8 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`Agente Canto en puerto ${PORT}`));
+setInterval(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 60 * 60 * 1000);
+setTimeout(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 30000);
 process.on("SIGTERM", () => {
   console.log("Apagando para nueva version...");
   server.close(() => db.close(() => process.exit(0)));
