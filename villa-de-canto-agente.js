@@ -280,7 +280,7 @@ VARIAS RESERVAS: un mismo cliente puede hacer mas de una reserva. Si dice que qu
 
 AVISO DE PAGO: si el cliente dice que ya deposito, ya pago, ya transfirio, o manda su comprobante, agradecele con calidez, dile que en breve confirmamos el pago, y agrega al FINAL de tu respuesta, en su propia linea, exactamente: AVISO_PAGO (el cliente no lo vera).
 
-FOTOS: si el cliente pide fotos, imagenes, ver la casa, las habitaciones o la alberca, responde con calidez algo breve como "¡Claro! Te comparto algunas fotos de la villa 📸" y agrega al FINAL de tu respuesta, en su propia linea, exactamente: ENVIAR_FOTOS (el cliente no lo vera). Las fotos se envian automaticamente; no digas que no puedes mandar fotos.
+FOTOS: ENVIAR_FOTOS es SOLO para fotos de la casa. Si piden fotos de pinatas, inflables o del paquete de fiesta, usa FOTOS_PINATAS y NUNCA ENVIAR_FOTOS. Si el cliente pide fotos de la casa, imagenes, ver la casa, las habitaciones o la alberca, responde con calidez algo breve como "¡Claro! Te comparto algunas fotos de la villa 📸" y agrega al FINAL de tu respuesta, en su propia linea, exactamente: ENVIAR_FOTOS (el cliente no lo vera). Las fotos se envian automaticamente; no digas que no puedes mandar fotos.
 
 MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada, mandale el link del contrato para que lo llene y firme desde su celular (https://docuseal.com/d/Y33pXN36zBKUXo), recuerdale que use los mismos datos de la cotizacion (fechas, noches, huespedes y montos), pidele una foto de su INE por este chat, y dale los datos de llegada: direccion, link de ubicacion en Google Maps (https://www.google.com/maps?q=20.6901757,-100.2620513), check-in 13:00, check-out 12:00, y el numero del administrador de la villa (33 1769 2871): con el se verifica cualquier persona extra o cambio de horario de entrada o salida. Nunca menciones la palabra SISTEMA.`;
 }
@@ -419,6 +419,7 @@ function procesarMensaje(phoneNumber, telefono, message, res) {
         fotosPinatas = "si";
         mensajeCliente = mensajeCliente.replace(/FOTOS_PINATAS/g, "").trim();
         console.log("FOTOS PINATAS solicitadas por", phoneNumber);
+        enviarFotos = "no";
       }
       mensajeCliente = mensajeCliente.replace(/\*\*(.+?)\*\*/g, "*$1*").replace(/^#+\s*/gm, "");
       if (!mensajeCliente.trim()) mensajeCliente = "Perfecto, ya quedo anotado 😊 ¿Algo mas en lo que te pueda ayudar?";
