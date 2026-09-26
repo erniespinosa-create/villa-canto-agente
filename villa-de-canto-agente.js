@@ -234,7 +234,7 @@ SERVICIOS: alberca climatizada 33-35C, horno de pizza, asador, gym, area de jueg
 
 PAQUETES ADICIONALES (se cobran aparte de la renta; se suman al total de la reserva si el cliente los quiere):
 - Cumpleanos $1,500: recamara decorada con letrero "Feliz Cumpleanos" y globos en el techo, globos metalicos con los numeros de la edad en el color que elijan, pastel de Pizca de Azucar (mandamos 3 opciones de sabor) y bengala para la sorpresa.
-- Fiesta Infantil $3,000: inflable instalado y encendido en el jardin a su llegada (3 opciones para elegir), pinata llena de dulces (3 modelos o el personaje favorito que pidan) y pastel de Pizca de Azucar (3 sabores, puede llevar mensaje o tematica).
+- Fiesta Infantil $3,000 (cuando pregunten por este paquete o por las pinatas, agrega al FINAL de tu respuesta, en su propia linea, FOTOS_PINATAS y di algo breve como "Te comparto algunos modelos de pinatas 🎉"; solo una vez por conversacion salvo que las pidan de nuevo): inflable instalado y encendido en el jardin a su llegada (3 opciones para elegir), pinata llena de dulces (3 modelos o el personaje favorito que pidan) y pastel de Pizca de Azucar (3 sabores, puede llevar mensaje o tematica).
 - Guerra de Globos de Agua $1,500: dos tinas grandes con globos de agua ya inflados y el jardin como campo de batalla.
 - Rocola y Karaoke $1,000: rocola durante toda la estancia, dos microfonos y canciones para todas las generaciones.
 - Masaje Relajante a Domicilio $1,200 por persona: masajista profesional llega a la villa con camilla, aceites e insumos; atiende uno a uno a quien quiera. Cada sesion dura 60 minutos por persona.
@@ -414,6 +414,12 @@ function procesarMensaje(phoneNumber, telefono, message, res) {
         mensajeCliente = mensajeCliente.replace(/ENVIAR_FOTOS/g, "").trim();
         console.log("FOTOS solicitadas por", phoneNumber);
       }
+      let fotosPinatas = "no";
+      if (mensajeCliente.includes("FOTOS_PINATAS")) {
+        fotosPinatas = "si";
+        mensajeCliente = mensajeCliente.replace(/FOTOS_PINATAS/g, "").trim();
+        console.log("FOTOS PINATAS solicitadas por", phoneNumber);
+      }
       mensajeCliente = mensajeCliente.replace(/\*\*(.+?)\*\*/g, "*$1*").replace(/^#+\s*/gm, "");
       if (!mensajeCliente.trim()) mensajeCliente = "Perfecto, ya quedo anotado 😊 ¿Algo mas en lo que te pueda ayudar?";
 
@@ -423,7 +429,7 @@ function procesarMensaje(phoneNumber, telefono, message, res) {
       db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))",
         [phoneNumber, JSON.stringify(history)]);
 
-      res.json({ response: mensajeCliente, avisoPago, enviarFotos });
+      res.json({ response: mensajeCliente, avisoPago, enviarFotos, fotosPinatas });
     } catch (error) {
       console.error(error);
       res.status(200).json({ response: "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?" });
