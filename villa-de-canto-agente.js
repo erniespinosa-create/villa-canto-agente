@@ -131,6 +131,31 @@ async function enviarPostEstancia() {
   }
 }
 
+// Recordatorio a los 15 dias: clientes que dejaron de contestar y no tienen reserva
+async function enviarSeguimientos() {
+  if (!process.env.MANYCHAT_API_KEY || !process.env.MANYCHAT_FLOW_SEGUIMIENTO) return;
+  const filas = await new Promise(ok => db.all(
+    `SELECT c.id, c.updated_at FROM conversations c LEFT JOIN seguimiento s ON s.id = c.id
+     WHERE c.updated_at <= datetime('now','-15 days') AND c.updated_at > datetime('now','-20 days')
+     AND (s.enviado_para IS NULL OR s.enviado_para <> c.updated_at)`, [], (e, r) => ok(e ? [] : r || [])));
+  for (const f of filas) {
+    try {
+      const r = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: [`contacto=${f.id}`], singleEvents: true, maxResults: 1 });
+      const marcar = () => db.run("INSERT OR REPLACE INTO seguimiento (id, enviado_para) VALUES (?, ?)", [f.id, f.updated_at]);
+      if ((r.data.items || []).length) { marcar(); continue; }
+      const resp = await fetch("https://api.manychat.com/fb/sending/sendFlow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.MANYCHAT_API_KEY}` },
+        body: JSON.stringify({ subscriber_id: f.id, flow_ns: process.env.MANYCHAT_FLOW_SEGUIMIENTO }),
+      });
+      const data = await resp.json();
+      if (data.status !== "success") { console.error("Seguimiento:", JSON.stringify(data)); continue; }
+      marcar();
+      console.log("Recordatorio 15 dias enviado a", f.id);
+    } catch (err) { console.error("Error seguimiento:", err.message); }
+  }
+}
+
 const TOOLS = [
   {
     name: "consultar_disponibilidad",
@@ -167,6 +192,7 @@ async function reservasDelCliente(contacto) {
 }
 
 const db = new sqlite3.Database(path.join(process.env.DB_DIR || "/tmp", "conversations.db"));
+db.run("CREATE TABLE IF NOT EXISTS seguimiento (id TEXT PRIMARY KEY, enviado_para TEXT)");
 db.run(`CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   messages TEXT,
@@ -193,7 +219,9 @@ DATOS:
 - Capacidad: 15 adultos + 2 ninos maximo (17 personas en total). ES UN LIMITE ESTRICTO: si el cliente pide mas adultos o mas ninos, dile con calidez que la capacidad maxima es de 15 adultos y 2 ninos, y pregunta si pueden ajustar el grupo. Nunca cotices ni apartes por encima de ese limite.
 - Direccion: Boulevard Rodolfo Gaona 106, Campestre Amazcala
 - Check-in 13:00 | Check-out 12:00
-- Contacto: David 33 1769 2871
+- Ubicacion en Google Maps: https://www.google.com/maps?q=20.6901757,-100.2620513
+- Administrador de la villa: David, 33 1769 2871. Estara al pendiente durante la estancia.
+- IMPORTANTE: si el cliente quiere que entren mas personas de las reservadas (o visitas), hacer check-in antes de las 13:00 o check-out despues de las 12:00, NO lo autorices ni lo niegues: dile con calidez que eso se tiene que verificar con David, el administrador, y dale su numero. No des su numero para nada mas (reservas, precios y pagos los resuelves tu).
 
 DISTRIBUCION DE HABITACIONES (5 habitaciones, todas con aire acondicionado):
 1. Cama King Size + Sofa Cama Individual + bano completo
@@ -204,10 +232,16 @@ DISTRIBUCION DE HABITACIONES (5 habitaciones, todas con aire acondicionado):
 
 SERVICIOS: alberca climatizada 33-35C, horno de pizza, asador, gym, area de juegos, estacionamiento 4 autos, limpieza incluida.
 
-PAQUETES ADICIONALES (se cotizan aparte de la renta):
-- Cumpleanos: decoracion del cuarto con globos, pastel con vela de bengala, decoracion de "Feliz Cumpleanos"
-- Hay otros paquetes disponibles (bodas, aniversarios, eventos especiales, etc.)
-Si preguntan por paquetes, confirma que existen y menciona el de cumpleanos como ejemplo. Los precios aun no estan definidos: dilo con naturalidad ("estamos por confirmar el costo de ese paquete, en breve te doy el numero exacto") sin inventar cifras ni remitir a otra persona.
+PAQUETES ADICIONALES (se cobran aparte de la renta; se suman al total de la reserva si el cliente los quiere):
+- Cumpleanos $1,500: recamara decorada con letrero "Feliz Cumpleanos" y globos en el techo, globos metalicos con los numeros de la edad en el color que elijan, pastel de Pizca de Azucar (mandamos 3 opciones de sabor) y bengala para la sorpresa.
+- Fiesta Infantil $3,000: inflable instalado y encendido en el jardin a su llegada (3 opciones para elegir), pinata llena de dulces (3 modelos o el personaje favorito que pidan) y pastel de Pizca de Azucar (3 sabores, puede llevar mensaje o tematica).
+- Guerra de Globos de Agua $1,500: dos tinas grandes con globos de agua ya inflados y el jardin como campo de batalla.
+- Rocola y Karaoke $1,000: rocola durante toda la estancia, dos microfonos y canciones para todas las generaciones.
+- Masaje Relajante a Domicilio $1,200 por persona: masajista profesional llega a la villa con camilla, aceites e insumos; atiende uno a uno a quien quiera. Cada sesion dura 60 minutos por persona.
+- Musica en Vivo y DJ (por cotizar): grupo norteno, mariachi, banda o DJ; proveedores de confianza que ya conocen la villa. El precio depende de fecha, duracion y disponibilidad.
+- Carne Asada con Anfitrion (por cotizar): el anfitrion hace las compras, tiene el carbon listo a su llegada y se queda a cargo del asador. Depende de adultos, ninos y tipo/cantidad de carne.
+- Experiencia Chef Privada (por cotizar): chef profesional de un restaurante de Queretaro cocina en la villa, menu de autor o personalizado, insumos incluidos, servicio a la mesa con chef y mesero. Depende de comensales y menu.
+COMO OFRECERLOS: no los listes todos de golpe. Si preguntan por paquetes, menciona los nombres en una linea y da el detalle solo del que les interese. Si el motivo del viaje encaja (cumpleanos, ninos, descanso, festejo), sugiere uno de forma natural, sin presionar, una sola vez. Para los "por cotizar" pide los datos que se necesitan (fecha, duracion, numero de personas, preferencias) y di que en breve les compartes la cotizacion; nunca inventes una cifra. Si agregan un paquete con precio, sumalo en la cotizacion como renglon aparte y recalcula el anticipo del 50% sobre el total.
 
 TARIFAS POR NOCHE (cada noche se cobra segun el dia en que se duerme):
 - Lunes a jueves y domingo: $10,500
@@ -248,7 +282,7 @@ AVISO DE PAGO: si el cliente dice que ya deposito, ya pago, ya transfirio, o man
 
 FOTOS: si el cliente pide fotos, imagenes, ver la casa, las habitaciones o la alberca, responde con calidez algo breve como "¡Claro! Te comparto algunas fotos de la villa 📸" y agrega al FINAL de tu respuesta, en su propia linea, exactamente: ENVIAR_FOTOS (el cliente no lo vera). Las fotos se envian automaticamente; no digas que no puedes mandar fotos.
 
-MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada, mandale el link del contrato para que lo llene y firme desde su celular (https://docuseal.com/d/Y33pXN36zBKUXo), recuerdale que use los mismos datos de la cotizacion (fechas, noches, huespedes y montos), pidele una foto de su INE por este chat, y dale los datos de llegada (direccion, check-in 13:00, check-out 12:00, contacto David 33 1769 2871). Nunca menciones la palabra SISTEMA.`;
+MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada, mandale el link del contrato para que lo llene y firme desde su celular (https://docuseal.com/d/Y33pXN36zBKUXo), recuerdale que use los mismos datos de la cotizacion (fechas, noches, huespedes y montos), pidele una foto de su INE por este chat, y dale los datos de llegada: direccion, link de ubicacion en Google Maps (https://www.google.com/maps?q=20.6901757,-100.2620513), check-in 13:00, check-out 12:00, y que David es el administrador de la villa (33 1769 2871): con el se verifica cualquier persona extra o cambio de horario de entrada o salida. Nunca menciones la palabra SISTEMA.`;
 }
 
 async function responderConClaude(history, contacto) {
@@ -315,6 +349,23 @@ app.post("/webhook", (req, res) => {
   }
   if (!phoneNumber || !message) return res.status(400).json({ error: "phoneNumber y message requeridos" });
 
+  // Espera ESPERA_MS por si el cliente manda varios mensajes seguidos; solo el ultimo contesta con todo junto
+  if (String(message).startsWith("[SISTEMA]")) return procesarMensaje(phoneNumber, telefono, message, res);
+  const p = pendientes.get(phoneNumber) || { textos: [] };
+  if (p.timer) { clearTimeout(p.timer); p.res.json({ response: "", omitir: "si" }); }
+  p.textos.push(String(message));
+  p.res = res;
+  p.timer = setTimeout(() => {
+    pendientes.delete(phoneNumber);
+    procesarMensaje(phoneNumber, telefono, p.textos.join("\n"), p.res);
+  }, ESPERA_MS);
+  pendientes.set(phoneNumber, p);
+});
+
+const ESPERA_MS = Number(process.env.ESPERA_MS || 3500);
+const pendientes = new Map();
+
+function procesarMensaje(phoneNumber, telefono, message, res) {
   db.get("SELECT messages FROM conversations WHERE id = ?", [phoneNumber], async (err, row) => {
     let history = row ? JSON.parse(row.messages) : [];
     history.push({ role: "user", content: String(message) });
@@ -378,7 +429,7 @@ app.post("/webhook", (req, res) => {
       res.status(200).json({ response: "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?" });
     }
   });
-});
+}
 
 app.use((err, req, res, next) => {
   if (err.type === "entity.parse.failed") return res.status(200).json({ response: "No entendí bien ese mensaje, ¿me lo repites?" });
@@ -389,6 +440,8 @@ const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`Agente Canto en puerto ${PORT}`));
 setInterval(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 60 * 60 * 1000);
 setTimeout(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 30000);
+setInterval(() => enviarSeguimientos().catch(e => console.error("Seguimiento:", e.message)), 60 * 60 * 1000);
+setTimeout(() => enviarSeguimientos().catch(e => console.error("Seguimiento:", e.message)), 60000);
 process.on("SIGTERM", () => {
   console.log("Apagando para nueva version...");
   server.close(() => db.close(() => process.exit(0)));
