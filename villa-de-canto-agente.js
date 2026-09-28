@@ -419,7 +419,7 @@ app.post("/webhook", (req, res) => {
   if (!phoneNumber || !message) return res.status(400).json({ error: "phoneNumber y message requeridos" });
 
   // Espera ESPERA_MS por si el cliente manda varios mensajes seguidos; solo el ultimo contesta con todo junto
-  if (String(message).startsWith("[SISTEMA]")) return procesarMensaje(phoneNumber, telefono, message, res);
+  if (String(message).startsWith("[SISTEMA]") || esReanudar(message)) return procesarMensaje(phoneNumber, telefono, message, res);
   const p = pendientes.get(phoneNumber) || { textos: [] };
   if (p.timer) { clearTimeout(p.timer); p.res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" }); }
   p.textos.push(String(message));
@@ -433,9 +433,17 @@ app.post("/webhook", (req, res) => {
 
 const ESPERA_MS = Number(process.env.ESPERA_MS || 3500);
 const pendientes = new Map();
+const esReanudar = m => /^\W*(sistema\W*)?reanudar\W*$/i.test(String(m).trim());
+
+// Reanudar desde el navegador: https://TU-APP.up.railway.app/reanudar/ID_DEL_CONTACTO
+app.get("/reanudar/:id", (req, res) => {
+  db.run("DELETE FROM pausas WHERE id = ?", [req.params.id]);
+  console.log("Agente reanudado (navegador) para", req.params.id);
+  res.send("Listo, el agente vuelve a contestar a " + req.params.id);
+});
 
 function procesarMensaje(phoneNumber, telefono, message, res) {
-  if (String(message).startsWith("[SISTEMA] REANUDAR")) {
+  if (esReanudar(message)) {
     db.run("DELETE FROM pausas WHERE id = ?", [phoneNumber]);
     console.log("Agente reanudado para", phoneNumber);
     return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
