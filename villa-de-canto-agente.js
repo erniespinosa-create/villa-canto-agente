@@ -29,7 +29,7 @@ async function bitacora(estado, d) {
       spreadsheetId: SHEET_ID,
       range: "Reservas!A:K",
       valueInputOption: "USER_ENTERED",
-      resource: { values: [[hoy, estado, d.nombre || "", d.telefono || "", d.llegada || "", d.salida || "", d.adultos ?? "", d.ninos ?? "", d.motivo || "", d.total ?? "", d.eventoId || ""]] },
+      resource: { values: [[hoy, estado, d.nombre || "", d.telefono || "", d.llegada || "", d.salida || "", d.adultos ?? "", d.ninos ?? "", (d.motivo || "") + (d.paquetes ? ` · Paquetes: ${d.paquetes}` : ""), d.total ?? "", d.eventoId || ""]] },
     });
   } catch (e) {
     console.error("Bitacora:", e.message);
@@ -42,7 +42,7 @@ function aISO(fecha) {
   return `${a}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
 }
 
-async function consultarDisponibilidad(llegada, salida) {
+async function consultarUnaVez(llegada, salida) {
   const r = await calendar.events.list({
     calendarId: CALENDAR_ID,
     timeMin: `${aISO(llegada)}T13:00:00-06:00`,
@@ -50,7 +50,17 @@ async function consultarDisponibilidad(llegada, salida) {
     singleEvents: true,
   });
   const ocupados = (r.data.items || []).filter(e => e.status !== "cancelled");
-  return { disponible: ocupados.length === 0 };
+  return { disponible: ocupados.length === 0, eventos: ocupados };
+}
+
+// Doble verificacion: consulta el calendario 2 veces (con 1.5 s de pausa); si alguna dice ocupado, esta ocupado
+async function consultarDisponibilidad(llegada, salida) {
+  const v1 = await consultarUnaVez(llegada, salida);
+  await new Promise(r => setTimeout(r, 1500));
+  const v2 = await consultarUnaVez(llegada, salida);
+  const disponible = v1.disponible && v2.disponible;
+  console.log("Doble verificacion", llegada, "-", salida, "| 1:", v1.disponible ? "LIBRE" : "OCUPADO", "| 2:", v2.disponible ? "LIBRE" : "OCUPADO");
+  return { disponible };
 }
 
 async function crearEventoCalendar(datos) {
@@ -63,11 +73,18 @@ async function crearEventoCalendar(datos) {
       summary: `⏳ PENDIENTE - ${datos.nombre}`,
       colorId: "8",
       extendedProperties: { private: { contacto: String(datos.contacto || ""), telefono: String(datos.telefono || ""), estado: "pendiente" } },
-      description: `Adultos: ${datos.adultos}\nNinos: ${datos.ninos || 0}\nMotivo: ${datos.motivo || "-"}\nTelefono: ${datos.telefono || "-"}`,
+      description: `Adultos: ${datos.adultos}\nNinos: ${datos.ninos || 0}\nMotivo: ${datos.motivo || "-"}\nPaquetes: ${datos.paquetes || "Ninguno"}\nTelefono: ${datos.telefono || "-"}`,
       start: { dateTime: `${aISO(datos.llegada)}T13:00:00`, timeZone: "America/Mexico_City" },
       end: { dateTime: `${aISO(datos.salida)}T12:00:00`, timeZone: "America/Mexico_City" },
     },
   });
+  // Verificacion posterior: si otro evento se agendo al mismo tiempo, se borra este y se avisa ocupado
+  const despues = await consultarUnaVez(datos.llegada, datos.salida);
+  if (despues.eventos.some(e => e.id !== evento.data.id)) {
+    await calendar.events.delete({ calendarId: CALENDAR_ID, eventId: evento.data.id });
+    console.log("Choque de reservas detectado, evento revertido:", evento.data.id);
+    return { ocupado: true };
+  }
   return { ocupado: false, id: evento.data.id };
 }
 
@@ -241,6 +258,7 @@ PAQUETES ADICIONALES (se cobran aparte de la renta; se suman al total de la rese
 - Musica en Vivo y DJ (por cotizar): grupo norteno, mariachi, banda o DJ; proveedores de confianza que ya conocen la villa. El precio depende de fecha, duracion y disponibilidad.
 - Carne Asada con Anfitrion: el anfitrion hace las compras, tiene el carbon listo a su llegada y se queda a cargo del asador. Este paquete se ve directamente con el administrador de la villa: NO pidas datos ni des precio; explica con calidez que ese servicio lo coordina el administrador de la villa y pidele al cliente que se ponga en contacto con el al 33 1769 2871 para que le comparta el precio y los detalles.
 - Experiencia Chef Privada (por cotizar): chef profesional de un restaurante de Queretaro cocina en la villa, menu de autor o personalizado, insumos incluidos, servicio a la mesa con chef y mesero. Depende de comensales y menu.
+PAQUETES POR COTIZAR (Musica en Vivo y DJ, Experiencia Chef Privada, y cualquiera sin precio): NO des precio ni rangos. Dile con calidez que le avisaras al administrador de la villa y el se pondra en contacto para darle una atencion mas personalizada y armarlo a su gusto. Anotalo en "paquetes" de la reserva con "(por cotizar)".
 COMO OFRECERLOS: no los listes todos de golpe. Si preguntan por paquetes, menciona los nombres en una linea y da el detalle solo del que les interese. Si el motivo del viaje encaja (cumpleanos, ninos, descanso, festejo), sugiere uno de forma natural, sin presionar, una sola vez. Para los "por cotizar" pide los datos que se necesitan (fecha, duracion, numero de personas, preferencias) y di que en breve les compartes la cotizacion; nunca inventes una cifra. Si agregan un paquete con precio, sumalo en la cotizacion como renglon aparte y recalcula el anticipo del 50% sobre el total.
 
 TARIFAS POR NOCHE (cada noche se cobra segun el dia en que se duerme):
@@ -256,7 +274,6 @@ PAGO:
 
 REGLAS:
 - No des descuentos
-- Pide contrato firmado + INE al confirmar
 - Link del contrato para firma digital: https://docuseal.com/d/Y33pXN36zBKUXo (solo mandalo cuando el pago ya este confirmado, o si el cliente lo pide despues de apartar)
 - Nunca pidas correo electronico
 
@@ -271,7 +288,8 @@ FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo 
 NO SEAS INSISTENTE: si el cliente solo esta preguntando (fotos, servicios, ubicacion, habitaciones, precios, paquetes, horarios), responde su pregunta y ya. NO termines cada mensaje preguntando por fechas o si quiere reservar. Maximo menciona la reserva UNA vez en toda la conversacion, de forma suave, y solo despues de haber resuelto varias dudas. Si el cliente ya dijo que solo esta viendo o que despues te avisa, no vuelvas a ofrecer reservar a menos que el lo pida. Deja que el cliente lleve el ritmo, como lo haria un buen anfitrion.
 
 CUANDO el cliente confirme que quiere reservar (y ya consultaste disponibilidad y esta libre), agrega al FINAL de tu respuesta, en su propia linea, exactamente esto (el cliente no lo vera):
-RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"...","total":N}
+RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"...","paquetes":"...","total":N}
+En "paquetes" pon los paquetes que le interesaron al cliente separados por coma (ej. "Fiesta Infantil, Karaoke"; marca los por cotizar asi: "Chef Privada (por cotizar)"); si ninguno, pon "Ninguno".
 Solo UNA vez por cada reserva confirmada (no la repitas si solo estan platicando de la misma reserva).
 
 EL CALENDARIO MANDA: lo que se hablo antes en esta conversacion puede estar desactualizado (el administrador puede cancelar o borrar reservas). Antes de decir que el cliente ya tiene una reserva, o si pregunta por su reserva o su pago, usa consultar_mis_reservas y confia SOLO en ese resultado. Si ahi no aparece, NO la tiene: tratala como reserva nueva (consulta disponibilidad, cotiza y genera un nuevo RESERVA_JSON cuando confirme). Nunca digas "ya la tenemos registrada" sin haberlo consultado.
@@ -281,6 +299,8 @@ VARIAS RESERVAS: un mismo cliente puede hacer mas de una reserva. Si dice que qu
 AVISO DE PAGO: si el cliente dice que ya deposito, ya pago, ya transfirio, o manda su comprobante, agradecele con calidez, dile que en breve confirmamos el pago, y agrega al FINAL de tu respuesta, en su propia linea, exactamente: AVISO_PAGO (el cliente no lo vera).
 
 FOTOS: ENVIAR_FOTOS es SOLO para fotos de la casa. Si piden fotos de pinatas, inflables o del paquete de fiesta, usa FOTOS_PINATAS y NUNCA ENVIAR_FOTOS. Si el cliente pide fotos de la casa, imagenes, ver la casa, las habitaciones o la alberca, responde con calidez algo breve como "¡Claro! Te comparto algunas fotos de la villa 📸" y agrega al FINAL de tu respuesta, en su propia linea, exactamente: ENVIAR_FOTOS (el cliente no lo vera). Las fotos se envian automaticamente; no digas que no puedes mandar fotos.
+
+CONTRATO E INE: NO hables del contrato ni pidas INE durante la cotizacion ni al apartar. Solo DESPUES de que el pago este confirmado ([SISTEMA] PAGO_CONFIRMADO), en ese mismo mensaje de confirmacion: felicitalo, dile que el administrador de la villa los recibira a su llegada para apoyarlos en lo que necesiten, y que para facilitarles todo el contrato es digital; comparte el link https://docuseal.com/d/Y33pXN36zBKUXo para que lo llenen y firmen desde el celular (ahi mismo suben su INE). Incluye tambien la ubicacion de Google Maps. Si antes de pagar preguntan por el contrato, di que se los compartimos en digital en cuanto se confirme el pago.
 
 MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada, mandale el link del contrato para que lo llene y firme desde su celular (https://docuseal.com/d/Y33pXN36zBKUXo), recuerdale que use los mismos datos de la cotizacion (fechas, noches, huespedes y montos), pidele una foto de su INE por este chat, y dale los datos de llegada: direccion, link de ubicacion en Google Maps (https://www.google.com/maps?q=20.6901757,-100.2620513), check-in 13:00, check-out 12:00, y el numero del administrador de la villa (33 1769 2871): con el se verifica cualquier persona extra o cambio de horario de entrada o salida. Nunca menciones la palabra SISTEMA.`;
 }
