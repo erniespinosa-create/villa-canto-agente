@@ -148,6 +148,53 @@ async function enviarPostEstancia() {
   }
 }
 
+async function manychat(ruta, body) {
+  const resp = await fetch("https://api.manychat.com/fb/sending/" + ruta, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.MANYCHAT_API_KEY}` },
+    body: JSON.stringify(body),
+  });
+  return resp.json();
+}
+const textoWA = (subscriber_id, text) => manychat("sendContent", { subscriber_id, data: { version: "v2", content: { type: "whatsapp", messages: [{ type: "text", text }] } } });
+
+// 1) Liberar reservas pendientes sin pago despues de HORAS_PENDIENTE (48 h por defecto)
+async function liberarPendientes() {
+  const horas = Number(process.env.HORAS_PENDIENTE || 48);
+  const r = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: ["estado=pendiente"], timeMin: new Date().toISOString(), singleEvents: true });
+  for (const e of r.data.items || []) {
+    if (Date.now() - new Date(e.created).getTime() < horas * 3600000) continue;
+    const p = e.extendedProperties?.private || {};
+    const fmt = s => (s || "").slice(0, 10).split("-").reverse().join("/");
+    try {
+      await calendar.events.delete({ calendarId: CALENDAR_ID, eventId: e.id });
+      console.log("Reserva pendiente liberada:", e.summary);
+      await bitacora("Liberada sin pago", { nombre: e.summary.replace(/^.*?-\s*/, ""), telefono: p.telefono, llegada: fmt(e.start.dateTime || e.start.date), salida: fmt(e.end.dateTime || e.end.date), eventoId: e.id });
+      if (process.env.MANYCHAT_API_KEY && p.contacto) {
+        const d = await textoWA(p.contacto, `Hola 🌿 Como no recibimos el anticipo, liberamos las fechas del ${fmt(e.start.dateTime || e.start.date)} al ${fmt(e.end.dateTime || e.end.date)}. Si aun te interesan, escribeme y reviso con gusto si siguen disponibles 😊`);
+        if (d.status !== "success") console.log("Aviso de liberacion no enviado (fuera de 24 h):", JSON.stringify(d));
+      }
+    } catch (err) { console.error("Error liberando:", err.message); }
+  }
+}
+
+// 5) Mensaje 1 dia antes de la llegada (plantilla de ManyChat)
+async function enviarPreLlegada() {
+  if (!process.env.MANYCHAT_API_KEY || !process.env.MANYCHAT_FLOW_LLEGADA) return;
+  const ahora = Date.now();
+  const r = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: ["estado=confirmada"], timeMin: new Date(ahora).toISOString(), timeMax: new Date(ahora + 30 * 3600000).toISOString(), singleEvents: true });
+  for (const e of r.data.items || []) {
+    const p = e.extendedProperties?.private || {};
+    if (p.prellegada === "enviada" || !p.contacto) continue;
+    try {
+      const d = await manychat("sendFlow", { subscriber_id: p.contacto, flow_ns: process.env.MANYCHAT_FLOW_LLEGADA });
+      if (d.status !== "success") { console.error("Pre-llegada:", JSON.stringify(d)); continue; }
+      await calendar.events.patch({ calendarId: CALENDAR_ID, eventId: e.id, resource: { extendedProperties: { private: { ...p, prellegada: "enviada" } } } });
+      console.log("Mensaje pre-llegada enviado:", e.summary);
+    } catch (err) { console.error("Error pre-llegada:", err.message); }
+  }
+}
+
 // Recordatorio a los 5 dias: clientes que dejaron de contestar y no tienen reserva
 async function enviarSeguimientos() {
   if (!process.env.MANYCHAT_API_KEY || !process.env.MANYCHAT_FLOW_SEGUIMIENTO) return;
@@ -210,6 +257,7 @@ async function reservasDelCliente(contacto) {
 
 const db = new sqlite3.Database(path.join(process.env.DB_DIR || "/tmp", "conversations.db"));
 db.run("CREATE TABLE IF NOT EXISTS seguimiento (id TEXT PRIMARY KEY, enviado_para TEXT)");
+db.run("CREATE TABLE IF NOT EXISTS pausas (id TEXT PRIMARY KEY, hasta INTEGER)");
 db.run(`CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   messages TEXT,
@@ -301,6 +349,8 @@ FOTOS: ENVIAR_FOTOS es SOLO para fotos de la casa. Si piden fotos de pinatas, in
 
 CONTRATO E INE: NO hables del contrato ni pidas INE durante la cotizacion ni al apartar, y NUNCA mandes link de contrato. El contrato lo llena el administrador de la villa junto con el huesped a su llegada, en formato digital (toma 2 minutos) y se requiere la INE. Mencionalo solo al confirmar el pago ([SISTEMA] PAGO_CONFIRMADO). Si antes preguntan por el contrato, explica exactamente eso.
 
+PASAR A UNA PERSONA: si el cliente pide hablar con una persona, con el dueno o el administrador, si esta molesto o frustrado, si tiene una queja, o si pregunta algo que no puedes resolver con esta informacion, dile con calidez que lo comunicas con el administrador de la villa y que en breve le escribe, y agrega al FINAL de tu respuesta, en su propia linea: PASAR_A_HUMANO. No sigas cotizando en ese mensaje.
+
 MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada. Luego, en tono cercano (NO como lista de tareas ni "Para terminar"), dile que el administrador de la villa los recibira a su llegada y, para facilitarles todo, llenaran juntos el contrato digital en ese momento (toma solo 2 minutos); que por favor tengan a la mano su INE, ya que se requiere para el contrato. NO mandes ningun link de contrato y NO pidas la INE por este chat. Despues dale los datos de llegada: direccion, link de ubicacion en Google Maps (https://www.google.com/maps?q=20.6901757,-100.2620513), check-in 13:00, check-out 12:00, y el numero del administrador de la villa (33 1769 2871): con el se verifica cualquier persona extra o cambio de horario de entrada o salida. Nunca menciones la palabra SISTEMA.`;
 }
 
@@ -371,7 +421,7 @@ app.post("/webhook", (req, res) => {
   // Espera ESPERA_MS por si el cliente manda varios mensajes seguidos; solo el ultimo contesta con todo junto
   if (String(message).startsWith("[SISTEMA]")) return procesarMensaje(phoneNumber, telefono, message, res);
   const p = pendientes.get(phoneNumber) || { textos: [] };
-  if (p.timer) { clearTimeout(p.timer); p.res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no" }); }
+  if (p.timer) { clearTimeout(p.timer); p.res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" }); }
   p.textos.push(String(message));
   p.res = res;
   p.timer = setTimeout(() => {
@@ -385,6 +435,21 @@ const ESPERA_MS = Number(process.env.ESPERA_MS || 3500);
 const pendientes = new Map();
 
 function procesarMensaje(phoneNumber, telefono, message, res) {
+  if (String(message).startsWith("[SISTEMA] REANUDAR")) {
+    db.run("DELETE FROM pausas WHERE id = ?", [phoneNumber]);
+    console.log("Agente reanudado para", phoneNumber);
+    return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+  }
+  db.get("SELECT hasta FROM pausas WHERE id = ?", [phoneNumber], (e0, pausa) => {
+    if (pausa && pausa.hasta > Date.now() && !String(message).startsWith("[SISTEMA]")) {
+      console.log("Agente en pausa (lo atiende una persona):", phoneNumber);
+      return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+    }
+    procesarConClaude(phoneNumber, telefono, message, res);
+  });
+}
+
+function procesarConClaude(phoneNumber, telefono, message, res) {
   db.get("SELECT messages FROM conversations WHERE id = ?", [phoneNumber], async (err, row) => {
     let history = row ? JSON.parse(row.messages) : [];
     history.push({ role: "user", content: String(message) });
@@ -433,6 +498,15 @@ function procesarMensaje(phoneNumber, telefono, message, res) {
         mensajeCliente = mensajeCliente.replace(/ENVIAR_FOTOS/g, "").trim();
         console.log("FOTOS solicitadas por", phoneNumber);
       }
+      let avisoHumano = "no";
+      if (mensajeCliente.includes("PASAR_A_HUMANO")) {
+        avisoHumano = "si";
+        mensajeCliente = mensajeCliente.replace(/PASAR_A_HUMANO/g, "").trim();
+        const horas = Number(process.env.HORAS_PAUSA || 12);
+        db.run("INSERT OR REPLACE INTO pausas (id, hasta) VALUES (?, ?)", [phoneNumber, Date.now() + horas * 3600000]);
+        console.log("PASAR A HUMANO:", phoneNumber, "- agente en pausa", horas, "h");
+        await bitacora("Pide hablar con persona", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber });
+      }
       let fotosPinatas = "no";
       if (mensajeCliente.includes("FOTOS_PINATAS")) {
         fotosPinatas = "si";
@@ -449,7 +523,7 @@ function procesarMensaje(phoneNumber, telefono, message, res) {
       db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))",
         [phoneNumber, JSON.stringify(history)]);
 
-      res.json({ response: mensajeCliente, avisoPago, enviarFotos, fotosPinatas });
+      res.json({ response: mensajeCliente, avisoPago, enviarFotos, fotosPinatas, avisoHumano });
     } catch (error) {
       console.error(error);
       res.status(200).json({ response: "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?" });
@@ -466,6 +540,9 @@ const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`Agente Canto en puerto ${PORT}`));
 setInterval(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 60 * 60 * 1000);
 setTimeout(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 30000);
+setInterval(() => liberarPendientes().catch(e => console.error("Liberar:", e.message)), 60 * 60 * 1000);
+setInterval(() => enviarPreLlegada().catch(e => console.error("Pre-llegada:", e.message)), 60 * 60 * 1000);
+setTimeout(() => { liberarPendientes().catch(() => {}); enviarPreLlegada().catch(() => {}); }, 90000);
 setInterval(() => enviarSeguimientos().catch(e => console.error("Seguimiento:", e.message)), 60 * 60 * 1000);
 setTimeout(() => enviarSeguimientos().catch(e => console.error("Seguimiento:", e.message)), 60000);
 process.on("SIGTERM", () => {
