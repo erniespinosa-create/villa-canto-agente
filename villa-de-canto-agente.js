@@ -506,6 +506,11 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         mensajeCliente = mensajeCliente.replace(/ENVIAR_FOTOS/g, "").trim();
         console.log("FOTOS solicitadas por", phoneNumber);
       }
+      const pidePersona = /(hablar|comunicar|contactar|atender|pasar)[^.?!]{0,30}(persona|humano|alguien|due[nñ]o|administrador|encargad|asesor|gerente)|quiero (una )?persona|no eres (una )?persona|eres (un )?(bot|robot)/i.test(String(message));
+      if (pidePersona && !mensajeCliente.includes("PASAR_A_HUMANO")) {
+        mensajeCliente = "Con gusto 🌿 Le aviso al administrador de la villa para que te escriba en breve y te atienda personalmente.";
+        mensajeCliente += "\nPASAR_A_HUMANO";
+      }
       let avisoHumano = "no";
       if (mensajeCliente.includes("PASAR_A_HUMANO")) {
         avisoHumano = "si";
