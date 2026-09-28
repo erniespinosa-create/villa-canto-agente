@@ -438,19 +438,38 @@ const esReanudar = m => /^\W*(sistema\W*)?reanudar\W*$/i.test(String(m).trim());
 // Reanudar desde el navegador: https://TU-APP.up.railway.app/reanudar/ID_DEL_CONTACTO
 app.get("/reanudar/:id", (req, res) => {
   db.run("DELETE FROM pausas WHERE id = ?", [req.params.id]);
+  anotarHistorial(req.params.id, NOTA_REANUDAR);
   console.log("Agente reanudado (navegador) para", req.params.id);
   res.send("Listo, el agente vuelve a contestar a " + req.params.id);
 });
 
+// Agrega texto al historial sin llamar a Claude (se une al ultimo mensaje del cliente si lo hay)
+function anotarHistorial(id, texto, cb) {
+  db.get("SELECT messages FROM conversations WHERE id = ?", [id], (err, row) => {
+    const h = row ? JSON.parse(row.messages) : [];
+    const last = h[h.length - 1];
+    if (last && last.role === "user") last.content = String(last.content) + "\n" + texto;
+    else h.push({ role: "user", content: texto });
+    db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))", [id, JSON.stringify(h)], () => cb && cb());
+  });
+}
+const NOTA_REANUDAR = "[SISTEMA] El administrador de la villa ya atendio personalmente al cliente en este chat (tu no viste esa parte de la conversacion). Ya NO digas que lo vas a comunicar ni que el administrador le escribira. Si el cliente vuelve a escribir, retoma con naturalidad, como si fueras parte del mismo equipo: responde lo que pregunte y, si aplica, preguntale amablemente si quedo resuelto o si le ayudas con algo mas (fechas, cotizacion, paquetes).";
+
 function procesarMensaje(phoneNumber, telefono, message, res) {
   if (esReanudar(message)) {
     db.run("DELETE FROM pausas WHERE id = ?", [phoneNumber]);
+    anotarHistorial(phoneNumber, NOTA_REANUDAR);
     console.log("Agente reanudado para", phoneNumber);
     return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
   }
   db.get("SELECT hasta FROM pausas WHERE id = ?", [phoneNumber], (e0, pausa) => {
+    if (pausa && pausa.hasta <= Date.now()) {
+      db.run("DELETE FROM pausas WHERE id = ?", [phoneNumber]);
+      return anotarHistorial(phoneNumber, NOTA_REANUDAR, () => procesarConClaude(phoneNumber, telefono, message, res));
+    }
     if (pausa && pausa.hasta > Date.now() && !String(message).startsWith("[SISTEMA]")) {
       console.log("Agente en pausa (lo atiende una persona):", phoneNumber);
+      anotarHistorial(phoneNumber, "[Mensaje del cliente mientras lo atendia el administrador]: " + message);
       return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
     }
     procesarConClaude(phoneNumber, telefono, message, res);
