@@ -148,12 +148,12 @@ async function enviarPostEstancia() {
   }
 }
 
-// Recordatorio a los 15 dias: clientes que dejaron de contestar y no tienen reserva
+// Recordatorio a los 5 dias: clientes que dejaron de contestar y no tienen reserva
 async function enviarSeguimientos() {
   if (!process.env.MANYCHAT_API_KEY || !process.env.MANYCHAT_FLOW_SEGUIMIENTO) return;
   const filas = await new Promise(ok => db.all(
     `SELECT c.id, c.updated_at FROM conversations c LEFT JOIN seguimiento s ON s.id = c.id
-     WHERE c.updated_at <= datetime('now','-15 days') AND c.updated_at > datetime('now','-20 days')
+     WHERE c.updated_at <= datetime('now','-5 days') AND c.updated_at > datetime('now','-10 days')
      AND (s.enviado_para IS NULL OR s.enviado_para <> c.updated_at)`, [], (e, r) => ok(e ? [] : r || [])));
   for (const f of filas) {
     try {
@@ -168,7 +168,7 @@ async function enviarSeguimientos() {
       const data = await resp.json();
       if (data.status !== "success") { console.error("Seguimiento:", JSON.stringify(data)); continue; }
       marcar();
-      console.log("Recordatorio 15 dias enviado a", f.id);
+      console.log("Recordatorio 5 dias enviado a", f.id);
     } catch (err) { console.error("Error seguimiento:", err.message); }
   }
 }
@@ -371,7 +371,7 @@ app.post("/webhook", (req, res) => {
   // Espera ESPERA_MS por si el cliente manda varios mensajes seguidos; solo el ultimo contesta con todo junto
   if (String(message).startsWith("[SISTEMA]")) return procesarMensaje(phoneNumber, telefono, message, res);
   const p = pendientes.get(phoneNumber) || { textos: [] };
-  if (p.timer) { clearTimeout(p.timer); p.res.json({ response: "", omitir: "si" }); }
+  if (p.timer) { clearTimeout(p.timer); p.res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no" }); }
   p.textos.push(String(message));
   p.res = res;
   p.timer = setTimeout(() => {
