@@ -434,7 +434,22 @@ app.post("/webhook", (req, res) => {
   pendientes.set(phoneNumber, p);
 });
 
-const ESPERA_MS = Number(process.env.ESPERA_MS || 3500);
+const ESPERA_MS = Number(process.env.ESPERA_MS || 3000);
+// ManyChat corta la espera a los ~10 s. Si Claude tarda mas (revisando calendario), se contesta un "un momento"
+// y la respuesta final se manda despues por la API de ManyChat (requiere MANYCHAT_API_KEY).
+const LIMITE_MS = Number(process.env.LIMITE_MS || 5500);
+async function enviarPorManyChat(id, texto) {
+  if (!process.env.MANYCHAT_API_KEY) { console.error("Falta MANYCHAT_API_KEY: no se pudo mandar la respuesta tardia a", id); return; }
+  try {
+    const r = await fetch("https://api.manychat.com/fb/sending/sendContent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.MANYCHAT_API_KEY}` },
+      body: JSON.stringify({ subscriber_id: id, data: { version: "v2", content: { type: "whatsapp", messages: [{ type: "text", text: texto }] } } }),
+    });
+    const d = await r.json();
+    console.log("Respuesta tardia enviada a", id, d.status);
+  } catch (e) { console.error("Error respuesta tardia:", e.message); }
+}
 const pendientes = new Map();
 const esReanudar = m => /^\W*(sistema\W*)?reanudar\W*$/i.test(String(m).trim());
 
@@ -493,7 +508,15 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
           console.error("Error confirmando reserva en Calendar:", e.message);
         }
       }
-      const reply = await responderConClaude(history, phoneNumber);
+      let enviado = false;
+      const timer = setTimeout(() => {
+        enviado = true;
+        console.log("Respuesta lenta, mando 'un momento' a", phoneNumber);
+        res.json({ response: "Déjame revisarlo un momento 🗓️ enseguida te confirmo.", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+      }, LIMITE_MS);
+      let reply;
+      try { reply = await responderConClaude(history, phoneNumber); }
+      catch (e) { clearTimeout(timer); if (enviado) { console.error(e); return enviarPorManyChat(phoneNumber, "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?"); } throw e; }
       let mensajeCliente = reply;
       const match = reply.match(/RESERVA_JSON:(\{.*\})/);
       if (match) {
@@ -558,10 +581,12 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
       db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))",
         [phoneNumber, JSON.stringify(history)]);
 
-      res.json({ response: mensajeCliente, avisoPago, enviarFotos, fotosPinatas, avisoHumano });
+      clearTimeout(timer);
+      if (enviado) enviarPorManyChat(phoneNumber, mensajeCliente);
+      else res.json({ response: mensajeCliente, avisoPago, enviarFotos, fotosPinatas, avisoHumano });
     } catch (error) {
       console.error(error);
-      res.status(200).json({ response: "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?" });
+      if (!res.headersSent) res.status(200).json({ response: "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?" });
     }
   });
 }
