@@ -423,21 +423,30 @@ app.post("/webhook", (req, res) => {
 
   // Espera ESPERA_MS por si el cliente manda varios mensajes seguidos; solo el ultimo contesta con todo junto
   if (String(message).startsWith("[SISTEMA]") || esReanudar(message)) return procesarMensaje(phoneNumber, telefono, message, res);
+  res.t0 = Date.now();
   const p = pendientes.get(phoneNumber) || { textos: [] };
   if (p.timer) { clearTimeout(p.timer); p.res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" }); }
   p.textos.push(String(message));
   p.res = res;
-  p.timer = setTimeout(() => {
+  const lanzar = () => {
+    // Si todavia esta contestando un mensaje anterior, espera a que termine y junta todo
+    if (procesando.has(phoneNumber)) { p.timer = setTimeout(lanzar, 700); return; }
     pendientes.delete(phoneNumber);
-    procesarMensaje(phoneNumber, telefono, p.textos.join("\n"), p.res);
-  }, ESPERA_MS);
+    procesando.add(phoneNumber);
+    console.log("Procesando", p.textos.length, "mensaje(s) de", phoneNumber);
+    Promise.resolve(procesarMensaje(phoneNumber, telefono, p.textos.join("\n"), p.res))
+      .catch(e => console.error("Error procesando:", e.message))
+      .finally(() => procesando.delete(phoneNumber));
+  };
+  p.timer = setTimeout(lanzar, ESPERA_MS);
   pendientes.set(phoneNumber, p);
 });
 
 const ESPERA_MS = Number(process.env.ESPERA_MS || 3000);
 // ManyChat corta la espera a los ~10 s. Si Claude tarda mas (revisando calendario), se contesta un "un momento"
 // y la respuesta final se manda despues por la API de ManyChat (requiere MANYCHAT_API_KEY).
-const LIMITE_MS = Number(process.env.LIMITE_MS || 5500);
+const LIMITE_MS = Number(process.env.LIMITE_MS || 7000); // tiempo total desde que llega el mensaje
+const procesando = new Set();
 async function enviarPorManyChat(id, texto) {
   if (!process.env.MANYCHAT_API_KEY) { console.error("Falta MANYCHAT_API_KEY: no se pudo mandar la respuesta tardia a", id); return; }
   try {
@@ -513,7 +522,7 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         enviado = true;
         console.log("Respuesta lenta, mando 'un momento' a", phoneNumber);
         res.json({ response: "Déjame revisarlo un momento 🗓️ enseguida te confirmo.", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
-      }, LIMITE_MS);
+      }, Math.max(300, LIMITE_MS - (Date.now() - (res.t0 || Date.now()))));
       let reply;
       try { reply = await responderConClaude(history, phoneNumber); }
       catch (e) { clearTimeout(timer); if (enviado) { console.error(e); return enviarPorManyChat(phoneNumber, "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?"); } throw e; }
