@@ -42,6 +42,50 @@ function aISO(fecha) {
   return `${a}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
 }
 
+// Detecta fechas en casi cualquier formato: "15 al 17 de noviembre", "15-17 nov", "15/11 al 17/11",
+// "15/11/2026-17/11/2026", "15noviembre 17noviembre", "30 de nov al 2 de dic"... -> { llegada, salida } en DD/MM/YYYY
+function extraerFechas(texto) {
+  const t = String(texto).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
+  const MES = { ene: 1, feb: 2, mar: 3, abr: 4, may: 5, jun: 6, jul: 7, ago: 8, sep: 9, set: 9, oct: 10, nov: 11, dic: 12 };
+  const M = "(ene|feb|mar|abr|may|jun|jul|ago|sep|set|oct|nov|dic)[a-z]*\\.?";
+  const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+  const anio = (d, m, a) => {
+    if (a) return a < 100 ? 2000 + a : a;
+    const y = hoy.getFullYear();
+    return new Date(y, m - 1, d) < hoy ? y + 1 : y;
+  };
+  const fmt = (d, m, a) => `${String(d).padStart(2, "0")}/${String(m).padStart(2, "0")}/${a}`;
+  const ok = (d, m) => d >= 1 && d <= 31 && m >= 1 && m <= 12;
+  let f = [];
+  // "15 al 17 de noviembre" / "15-17 nov"
+  let r = t.match(new RegExp("(\\d{1,2})\\s*(?:al|a|y|-|–|hasta(?: el)?)\\s*(?:el )?(\\d{1,2})\\s*(?:de\\s*)?" + M + "(?:\\s*(?:de|del)?\\s*(\\d{4}))?"));
+  if (r) {
+    const m2 = MES[r[3]], d1 = +r[1], d2 = +r[2], a = r[4] ? +r[4] : null;
+    const m1 = d2 < d1 ? (m2 === 1 ? 12 : m2 - 1) : m2;
+    if (ok(d1, m1) && ok(d2, m2)) f = [[d1, m1, a], [d2, m2, a]];
+  }
+  if (f.length < 2) {
+    f = [];
+    const re = new RegExp("(\\d{1,2})\\s*(?:de\\s*)?" + M + "(?:\\s*(?:de|del)?\\s*(\\d{4}))?|(\\d{1,2})\\s*[\\/\\-\\.]\\s*(\\d{1,2})(?:\\s*[\\/\\-\\.]\\s*(\\d{2,4}))?", "g");
+    for (const x of t.matchAll(re)) {
+      if (x[1] && ok(+x[1], MES[x[2]])) f.push([+x[1], MES[x[2]], x[3] ? +x[3] : null]);
+      else if (x[4] && ok(+x[4], +x[5])) f.push([+x[4], +x[5], x[6] ? +x[6] : null]);
+      if (f.length === 2) break;
+    }
+  }
+  if (f.length < 2) {
+    const s = t.match(/(\d{1,2}) (\d{1,2})(?: (\d{4}))? (?:al|a|-|y|hasta) (\d{1,2}) (\d{1,2})(?: (\d{4}))?/);
+    if (s && ok(+s[1], +s[2]) && ok(+s[4], +s[5])) f = [[+s[1], +s[2], s[3] ? +s[3] : null], [+s[4], +s[5], s[6] ? +s[6] : null]];
+  }
+  if (f.length < 2) return null;
+  const [a1, a2] = [f[0], f[1]];
+  const y1 = anio(a1[0], a1[1], a1[2] || a2[2]);
+  let y2 = a2[2] ? (a2[2] < 100 ? 2000 + a2[2] : a2[2]) : y1;
+  if (new Date(y2, a2[1] - 1, a2[0]) <= new Date(y1, a1[1] - 1, a1[0])) y2 = y1 + 1;
+  if (new Date(y2, a2[1] - 1, a2[0]) - new Date(y1, a1[1] - 1, a1[0]) > 30 * 86400000) return null;
+  return { llegada: fmt(a1[0], a1[1], y1), salida: fmt(a2[0], a2[1], y2) };
+}
+
 async function consultarUnaVez(llegada, salida) {
   const r = await calendar.events.list({
     calendarId: CALENDAR_ID,
@@ -447,6 +491,7 @@ const ESPERA_MS = Number(process.env.ESPERA_MS || 3000);
 // y la respuesta final se manda despues por la API de ManyChat (requiere MANYCHAT_API_KEY).
 const LIMITE_MS = Number(process.env.LIMITE_MS || 8500); // tiempo total desde que llega el mensaje
 const procesando = new Set();
+const grupoGrande = new Map(); // clientes con grupo grande a los que les faltan fechas
 const planGrupo = new Map();
 async function enviarPorManyChat(id, texto) {
   if (!process.env.MANYCHAT_API_KEY) { console.error("Falta MANYCHAT_API_KEY: no se pudo mandar la respuesta tardia a", id); return; }
@@ -571,12 +616,34 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
       const txt = String(message).toLowerCase();
       const nAdultos = Math.max(0, ...[...txt.matchAll(/(\d{1,3})\s*(adultos?|personas?|pax|invitados?|huespedes?|huéspedes?|gente)/g)].map(m => +m[1]));
       const nNinos = Math.max(0, ...[...txt.matchAll(/(\d{1,3})\s*(niñ[oa]s?|nin[oa]s?|menores?)/g)].map(m => +m[1]));
+      const esGrupo = nAdultos > 17 || nNinos > 2 || (/adult/.test(txt) && nAdultos > 15);
       const FINAL_GRUPO = "¡Muchas gracias por compartirnos su plan! 🌿 En breve el administrador de la villa se pondrá en contacto contigo para darte una atención personalizada. ¡Gracias!";
       const espera = planGrupo.get(phoneNumber);
       if (espera && Date.now() - espera < 48 * 3600000) {
         planGrupo.delete(phoneNumber);
         console.log("PLAN DE GRUPO recibido de", phoneNumber);
         mensajeCliente = FINAL_GRUPO + "\nPASAR_A_HUMANO";
+      } else if (!pidePersona && (esGrupo || (grupoGrande.get(phoneNumber) && Date.now() - grupoGrande.get(phoneNumber) < 48 * 3600000))) {
+        // Grupo grande: 1) fechas  2) disponibilidad (doble verificacion)  3) preguntar el plan
+        const f = extraerFechas(message);
+        if (!f) {
+          grupoGrande.set(phoneNumber, Date.now());
+          mensajeCliente = "¡Qué gusto que quieran venir en grupo! 🌿 ¿Para qué fechas lo tienen pensado (llegada y salida)? Así reviso la disponibilidad 🗓️";
+          console.log("GRUPO GRANDE: pido fechas a", phoneNumber);
+        } else {
+          let disp = { disponible: true };
+          try { disp = await consultarDisponibilidad(f.llegada, f.salida); } catch (e) { console.error("Disponibilidad grupo:", e.message); }
+          console.log("GRUPO GRANDE:", f.llegada, "-", f.salida, disp.disponible ? "LIBRE" : "OCUPADO", phoneNumber);
+          if (!disp.disponible) {
+            grupoGrande.set(phoneNumber, Date.now());
+            mensajeCliente = `Revisé el calendario y del ${f.llegada} al ${f.salida} ya no tenemos disponibilidad 😔 ¿Te gustaría que revisemos otras fechas?`;
+          } else {
+            grupoGrande.delete(phoneNumber);
+            planGrupo.set(phoneNumber, Date.now());
+            mensajeCliente = `¡Buenas noticias! 🎉 Sí tenemos disponibilidad del ${f.llegada} al ${f.salida}.\n\nLa villa tiene capacidad regular de 15 adultos y 2 niños; para grupos más grandes el administrador de la villa te dará una atención personalizada. Para pasarle toda la información, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración y cuántas personas serían en total) 😊`;
+          }
+        }
+        reply = mensajeCliente;
       } else if (mensajeCliente.includes("PASAR_A_HUMANO") && !pidePersona && /ocupad|no (hay|tenemos|est[aá]n?) disponib/i.test(mensajeCliente)) {
         mensajeCliente = mensajeCliente.replace(/PASAR_A_HUMANO/g, "").trim();
         console.log("GRUPO GRANDE: fechas ocupadas, no se pasa al administrador", phoneNumber);
