@@ -281,7 +281,7 @@ NUNCA INVENTES DATOS: usa solo lo que el cliente escribio literalmente. Si dice 
 DISPONIBILIDAD: en cuanto tengas fecha de llegada y de salida, usa la herramienta consultar_disponibilidad ANTES de cotizar. Si no esta disponible, dilo con calidez y ofrece buscar otras fechas. Nunca digas que hay disponibilidad sin haberla consultado.
 
 DATOS:
-- Capacidad: 15 adultos + 2 ninos maximo (17 personas en total). ES UN LIMITE ESTRICTO: si el cliente pide mas adultos o mas ninos, dile con calidez que la capacidad regular es de 15 adultos y 2 ninos y que para grupos mas grandes el administrador de la villa le dara una atencion personalizada. PRIMERO preguntale con calidez cual es el plan o que tiene en mente (tipo de evento o celebracion, fechas y numero total de personas) y agrega al FINAL, en su propia linea, PASAR_A_HUMANO (el sistema esperara su respuesta antes de avisar al administrador). Nunca cotices ni apartes por encima de ese limite.
+- Capacidad: 15 adultos + 2 ninos maximo (17 personas en total). ES UN LIMITE ESTRICTO: si el cliente pide mas adultos o mas ninos, dile con calidez que la capacidad regular es de 15 adultos y 2 ninos y que para grupos mas grandes el administrador de la villa le dara una atencion personalizada. ANTES DE TODO, si ya te dio fechas, usa consultar_disponibilidad: si estan OCUPADAS dile con calidez que esas fechas no estan disponibles, ofrece buscar otras y NO agregues PASAR_A_HUMANO (cuando te de fechas libres continuas). Si estan LIBRES, dile que si hay disponibilidad para esas fechas. Si aun no te da fechas, pideselas primero. Solo con fechas LIBRES preguntale con calidez cual es el plan o que tiene en mente (tipo de evento o celebracion, fechas y numero total de personas) y agrega al FINAL, en su propia linea, PASAR_A_HUMANO (el sistema esperara su respuesta antes de avisar al administrador). Nunca cotices ni apartes por encima de ese limite.
 - Direccion: Boulevard Rodolfo Gaona 106, Campestre Amazcala
 - Check-in 13:00 | Check-out 12:00
 - Ubicacion en Google Maps: https://www.google.com/maps?q=20.6901757,-100.2620513
@@ -577,11 +577,17 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         planGrupo.delete(phoneNumber);
         console.log("PLAN DE GRUPO recibido de", phoneNumber);
         mensajeCliente = FINAL_GRUPO + "\nPASAR_A_HUMANO";
+      } else if (mensajeCliente.includes("PASAR_A_HUMANO") && !pidePersona && /ocupad|no (hay|tenemos|est[aá]n?) disponib/i.test(mensajeCliente)) {
+        mensajeCliente = mensajeCliente.replace(/PASAR_A_HUMANO/g, "").trim();
+        console.log("GRUPO GRANDE: fechas ocupadas, no se pasa al administrador", phoneNumber);
       } else if (mensajeCliente.includes("PASAR_A_HUMANO") && !pidePersona && (nAdultos > 15 || nNinos > 2 || /capacidad|grupo|15 adultos|personas en total|m[aá]s grande/i.test(mensajeCliente + " " + txt))) {
         mensajeCliente = mensajeCliente.replace(/PASAR_A_HUMANO/g, "").trim();
         if (!/plan|tienen en mente|evento|celebraci/i.test(mensajeCliente)) mensajeCliente += "\n\nPara pasarle toda la información al administrador, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración, fechas y cuántas personas serían en total) 😊";
         planGrupo.set(phoneNumber, Date.now());
         console.log("GRUPO GRANDE (IA): pregunto el plan a", phoneNumber);
+      } else if ((nAdultos > 17 || nNinos > 2 || (/adult/.test(txt) && nAdultos > 15)) && !mensajeCliente.includes("PASAR_A_HUMANO") && /ocupad|no (hay|tenemos|est[aá]n?) disponib|otras fechas|qu[eé] fechas|cu[aá]les fechas/i.test(mensajeCliente)) {
+        // La IA ya contesto sobre disponibilidad/fechas (ocupadas o faltan fechas): se respeta su respuesta
+        console.log("GRUPO GRANDE: esperando fechas libres de", phoneNumber);
       } else if ((nAdultos > 17 || nNinos > 2 || (/adult/.test(txt) && nAdultos > 15)) && !mensajeCliente.includes("PASAR_A_HUMANO")) {
         console.log("GRUPO GRANDE:", nAdultos, "adultos /", nNinos, "ninos de", phoneNumber);
         mensajeCliente = "¡Qué gusto que quieran venir en grupo! 🌿 La villa tiene capacidad regular de 15 adultos y 2 niños. Para grupos más grandes, el administrador de la villa te dará una atención personalizada. Para pasarle toda la información, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración, fechas y cuántas personas serían en total) 😊";
