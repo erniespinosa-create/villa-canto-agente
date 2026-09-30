@@ -281,7 +281,7 @@ NUNCA INVENTES DATOS: usa solo lo que el cliente escribio literalmente. Si dice 
 DISPONIBILIDAD: en cuanto tengas fecha de llegada y de salida, usa la herramienta consultar_disponibilidad ANTES de cotizar. Si no esta disponible, dilo con calidez y ofrece buscar otras fechas. Nunca digas que hay disponibilidad sin haberla consultado.
 
 DATOS:
-- Capacidad: 15 adultos + 2 ninos maximo (17 personas en total). ES UN LIMITE ESTRICTO: si el cliente pide mas adultos o mas ninos, dile con calidez que la capacidad regular es de 15 adultos y 2 ninos y que, para grupos mas grandes, el administrador de la villa se pondra en contacto con el/ella para recopilar mas informacion y darle una atencion personalizada. Preguntale con calidez cual es el plan o que tiene en mente (tipo de evento o celebracion, fechas y numero total de personas), y agrega al FINAL de tu respuesta, en su propia linea, PASAR_A_HUMANO. Nunca cotices ni apartes por encima de ese limite.
+- Capacidad: 15 adultos + 2 ninos maximo (17 personas en total). ES UN LIMITE ESTRICTO: si el cliente pide mas adultos o mas ninos, dile con calidez que la capacidad regular es de 15 adultos y 2 ninos y que para grupos mas grandes el administrador de la villa le dara una atencion personalizada. PRIMERO preguntale con calidez cual es el plan o que tiene en mente (tipo de evento o celebracion, fechas y numero total de personas) y agrega al FINAL, en su propia linea, PASAR_A_HUMANO (el sistema esperara su respuesta antes de avisar al administrador). Nunca cotices ni apartes por encima de ese limite.
 - Direccion: Boulevard Rodolfo Gaona 106, Campestre Amazcala
 - Check-in 13:00 | Check-out 12:00
 - Ubicacion en Google Maps: https://www.google.com/maps?q=20.6901757,-100.2620513
@@ -447,6 +447,7 @@ const ESPERA_MS = Number(process.env.ESPERA_MS || 3000);
 // y la respuesta final se manda despues por la API de ManyChat (requiere MANYCHAT_API_KEY).
 const LIMITE_MS = Number(process.env.LIMITE_MS || 8500); // tiempo total desde que llega el mensaje
 const procesando = new Set();
+const planGrupo = new Map();
 async function enviarPorManyChat(id, texto) {
   if (!process.env.MANYCHAT_API_KEY) { console.error("Falta MANYCHAT_API_KEY: no se pudo mandar la respuesta tardia a", id); return; }
   try {
@@ -536,7 +537,8 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
           datos.telefono = (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber;
           const r = await crearEventoCalendar(datos);
           if (r.excedido) {
-            mensajeCliente += "\n\nUna aclaración 🙏 la villa tiene capacidad regular de 15 adultos y 2 niños. Para grupos más grandes, el administrador de la villa se pondrá en contacto contigo para recopilar más información y darte una atención personalizada 🌿 ¿Me cuentas cuál es el plan o qué tienen en mente?\nPASAR_A_HUMANO";
+            mensajeCliente += "\n\nUna aclaración 🙏 la villa tiene capacidad regular de 15 adultos y 2 niños. Para grupos más grandes, el administrador de la villa te dará una atención personalizada 🌿 ¿Me cuentas cuál es el plan o qué tienen en mente?";
+            planGrupo.set(phoneNumber, Date.now());
           } else if (r.ocupado) {
             mensajeCliente += "\n\nAy, justo acabo de revisar y esas fechas se acaban de ocupar 😔 ¿Buscamos otras fechas cercanas?";
           } else {
@@ -569,9 +571,21 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
       const txt = String(message).toLowerCase();
       const nAdultos = Math.max(0, ...[...txt.matchAll(/(\d{1,3})\s*(adultos?|personas?|pax|invitados?|huespedes?|huéspedes?|gente)/g)].map(m => +m[1]));
       const nNinos = Math.max(0, ...[...txt.matchAll(/(\d{1,3})\s*(niñ[oa]s?|nin[oa]s?|menores?)/g)].map(m => +m[1]));
-      if ((nAdultos > 17 || nNinos > 2 || (/adult/.test(txt) && nAdultos > 15)) && !mensajeCliente.includes("PASAR_A_HUMANO")) {
+      const FINAL_GRUPO = "¡Muchas gracias por compartirnos su plan! 🌿 En breve el administrador de la villa se pondrá en contacto contigo para darte una atención personalizada. ¡Gracias!";
+      const espera = planGrupo.get(phoneNumber);
+      if (espera && Date.now() - espera < 48 * 3600000) {
+        planGrupo.delete(phoneNumber);
+        console.log("PLAN DE GRUPO recibido de", phoneNumber);
+        mensajeCliente = FINAL_GRUPO + "\nPASAR_A_HUMANO";
+      } else if (mensajeCliente.includes("PASAR_A_HUMANO") && !pidePersona && (nAdultos > 15 || nNinos > 2 || /capacidad|grupo|15 adultos|personas en total|m[aá]s grande/i.test(mensajeCliente + " " + txt))) {
+        mensajeCliente = mensajeCliente.replace(/PASAR_A_HUMANO/g, "").trim();
+        if (!/plan|tienen en mente|evento|celebraci/i.test(mensajeCliente)) mensajeCliente += "\n\nPara pasarle toda la información al administrador, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración, fechas y cuántas personas serían en total) 😊";
+        planGrupo.set(phoneNumber, Date.now());
+        console.log("GRUPO GRANDE (IA): pregunto el plan a", phoneNumber);
+      } else if ((nAdultos > 17 || nNinos > 2 || (/adult/.test(txt) && nAdultos > 15)) && !mensajeCliente.includes("PASAR_A_HUMANO")) {
         console.log("GRUPO GRANDE:", nAdultos, "adultos /", nNinos, "ninos de", phoneNumber);
-        mensajeCliente = "¡Qué gusto que quieran venir en grupo! 🌿 La villa tiene capacidad regular de 15 adultos y 2 niños. Para grupos más grandes, el administrador de la villa se pondrá en contacto contigo para recopilar más información y darte una atención personalizada. Para que te pueda ayudar mejor, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración, fechas y cuántas personas serían en total) 😊\nPASAR_A_HUMANO";
+        mensajeCliente = "¡Qué gusto que quieran venir en grupo! 🌿 La villa tiene capacidad regular de 15 adultos y 2 niños. Para grupos más grandes, el administrador de la villa te dará una atención personalizada. Para pasarle toda la información, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración, fechas y cuántas personas serían en total) 😊";
+        planGrupo.set(phoneNumber, Date.now());
       }
       let avisoHumano = "no";
       if (mensajeCliente.includes("PASAR_A_HUMANO")) {
