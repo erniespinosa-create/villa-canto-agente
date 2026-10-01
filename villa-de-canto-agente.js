@@ -369,6 +369,8 @@ REGLAS:
 - No des descuentos
 - Nunca pidas correo electronico
 
+IDIOMA: responde SIEMPRE en el idioma en que te escribe el cliente (espanol, ingles, frances, etc.). Si cambia de idioma, cambia tu tambien. Manten los precios en pesos mexicanos (MXN) y las fechas en formato DD/MM/AAAA. Los marcadores internos (RESERVA_JSON, PASAR_A_HUMANO, FOTOS_CASA, FOTOS_PINATAS, etc.) se escriben siempre igual, sin traducir.
+
 TONO: calido, pausado, conversacional. Emojis ocasionales. Nunca robotico.
 
 LONGITUD: estas en WhatsApp. Responde CORTO, maximo 4-6 lineas por mensaje, como una persona. No mandes toda la informacion de golpe; da solo lo que pregunto y ofrece mas si lo quiere. Si el cliente pide "toda la informacion", da un resumen breve (ubicacion, capacidad, servicios, tarifas) en maximo 10 lineas, sin listar cada habitacion a menos que la pida. FORMATO WHATSAPP: para negritas usa UN solo asterisco (*texto*), nunca dos; no uses #, ni tablas.
@@ -566,8 +568,9 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
       let enviado = false;
       const timer = setTimeout(() => {
         enviado = true;
-        console.log("Respuesta lenta, mando 'un momento' a", phoneNumber);
-        res.json({ response: "Déjame revisarlo un momento 🗓️ enseguida te confirmo.", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+        console.log("Respuesta lenta, se enviara completa por API a", phoneNumber);
+        // Sin mensaje intermedio: ManyChat recibe vacio (la condicion res_respuesta no esta vacio lo ignora) y la respuesta completa llega por API
+        res.json({ response: process.env.MENSAJE_ESPERA || "", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
       }, Math.max(300, LIMITE_MS - (Date.now() - (res.t0 || Date.now()))));
       let reply;
       try { reply = await responderConClaude(history, phoneNumber); }
