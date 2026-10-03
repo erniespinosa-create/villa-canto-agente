@@ -58,7 +58,7 @@ function extraerFechas(texto) {
   const ok = (d, m) => d >= 1 && d <= 31 && m >= 1 && m <= 12;
   let f = [];
   // "15 al 17 de noviembre" / "15-17 nov"
-  let r = t.match(new RegExp("(\\d{1,2})\\s*(?:al|a|y|-|–|hasta(?: el)?)\\s*(?:el )?(\\d{1,2})\\s*(?:de\\s*)?" + M + "(?:\\s*(?:de|del)?\\s*(\\d{4}))?"));
+  let r = t.match(new RegExp("(\\d{1,2})\\s*(?:al|a|y|-|–|hasta(?: el)?)\\s*(?:el )?(?:(?:lunes|martes|miercoles|jueves|viernes|sabado|domingo)\\s*)?(\\d{1,2})\\s*(?:de\\s*)?" + M + "(?:\\s*(?:de|del)?\\s*(\\d{4}))?"));
   if (r) {
     const m2 = MES[r[3]], d1 = +r[1], d2 = +r[2], a = r[4] ? +r[4] : null;
     const m1 = d2 < d1 ? (m2 === 1 ? 12 : m2 - 1) : m2;
@@ -76,6 +76,11 @@ function extraerFechas(texto) {
   if (f.length < 2) {
     const s = t.match(/(\d{1,2}) (\d{1,2})(?: (\d{4}))? (?:al|a|-|y|hasta) (\d{1,2}) (\d{1,2})(?: (\d{4}))?/);
     if (s && ok(+s[1], +s[2]) && ok(+s[4], +s[5])) f = [[+s[1], +s[2], s[3] ? +s[3] : null], [+s[4], +s[5], s[6] ? +s[6] : null]];
+  }
+  if (f.length < 2) {
+    const W = "(?:lunes|martes|miercoles|jueves|viernes|sabado|domingo)";
+    const q = t.match(new RegExp(M + "(?:\\s*(?:de|del)?\\s*(\\d{4}))?[\\s,.:]*(?:(?:el|del|" + W + ")[\\s,.:]*)*(\\d{1,2})(?!\\d)[\\s,.:]*(?:(?:al|a|y|hasta|-|el|del|" + W + ")[\\s,.:]*)*(\\d{1,2})(?!\\d)"));
+    if (q && ok(+q[3], MES[q[1]]) && ok(+q[4], MES[q[1]]) && +q[4] > +q[3]) f = [[+q[3], MES[q[1]], q[2] ? +q[2] : null], [+q[4], MES[q[1]], q[2] ? +q[2] : null]];
   }
   if (f.length < 2) return null;
   const [a1, a2] = [f[0], f[1]];
@@ -459,9 +464,30 @@ app.get("/privacidad", (req, res) => res.send(`<!doctype html><html lang="es"><h
 <p style="color:#666">Última actualización: septiembre 2026</p>
 </body></html>`));
 
-app.post("/webhook", (req, res) => {
-  const { phoneNumber, telefono } = req.body || {};
-  let { message } = req.body || {};
+async function infoContacto(id) {
+  if (!process.env.MANYCHAT_API_KEY) { console.error("Falta MANYCHAT_API_KEY para leer el mensaje"); return {}; }
+  try {
+    const r = await fetch("https://api.manychat.com/fb/subscriber/getInfo?subscriber_id=" + encodeURIComponent(id), { headers: { Authorization: "Bearer " + process.env.MANYCHAT_API_KEY } });
+    const d = await r.json();
+    if (d.status !== "success") { console.error("ManyChat getInfo:", JSON.stringify(d)); return {}; }
+    return d.data || {};
+  } catch (e) { console.error("ManyChat getInfo:", e.message); return {}; }
+}
+
+app.post("/webhook", async (req, res) => {
+  res.t0 = Date.now();
+  const b = req.body || {};
+  const c = (b.last_input_text !== undefined ? b : Object.values(b).find(v => v && typeof v === "object" && "last_input_text" in v)) || {};
+  let phoneNumber = b.phoneNumber || c.id;
+  let telefono = b.telefono || c.whatsapp_phone || c.phone;
+  let message = b.message || c.last_input_text;
+  // ManyChat no puede mandar en el JSON mensajes con saltos de linea o comillas: el texto se lee directo de su API
+  if (!message && phoneNumber) {
+    const info = await infoContacto(phoneNumber);
+    message = info.last_input_text || "";
+    telefono = telefono || info.whatsapp_phone || info.phone || "";
+    console.log("Mensaje leido de ManyChat:", JSON.stringify(String(message)).slice(0, 150));
+  }
   if (message && /^https?:\/\/\S+$/i.test(String(message).trim())) {
     message = "[El cliente envio una imagen. Si ya le diste los datos bancarios, es su comprobante de pago]";
   }
@@ -469,10 +495,9 @@ app.post("/webhook", (req, res) => {
 
   // Espera ESPERA_MS por si el cliente manda varios mensajes seguidos; solo el ultimo contesta con todo junto
   if (String(message).startsWith("[SISTEMA]") || esReanudar(message)) return procesarMensaje(phoneNumber, telefono, message, res);
-  res.t0 = Date.now();
   const p = pendientes.get(phoneNumber) || { textos: [] };
   if (p.timer) { clearTimeout(p.timer); p.res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" }); }
-  p.textos.push(String(message));
+  if (!p.textos.includes(String(message))) p.textos.push(String(message));
   p.res = res;
   const lanzar = () => {
     // Si todavia esta contestando un mensaje anterior, espera a que termine y junta todo
