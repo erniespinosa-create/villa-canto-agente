@@ -284,23 +284,34 @@ const TOOLS = [
   },
   {
     name: "consultar_mis_reservas",
-    description: "Devuelve las reservas vigentes de ESTE cliente segun el calendario real. Usala siempre que el cliente mencione su reserva, su pago, o antes de decir que ya tiene algo apartado.",
-    input_schema: { type: "object", properties: {} },
+    description: "Devuelve las reservas vigentes de ESTE cliente segun el calendario real. Usala siempre que el cliente mencione su reserva, su pago, o antes de decir que ya tiene algo apartado. Si el cliente dice que la reserva la hizo con el administrador o por otro medio, pasa su nombre en el campo nombre para buscarla tambien por nombre.",
+    input_schema: { type: "object", properties: { nombre: { type: "string", description: "Nombre (o apellido) del cliente tal como lo dijo, para encontrar reservas que el administrador agendo a mano" } } },
   },
 ];
 
-async function reservasDelCliente(contacto) {
+async function reservasDelCliente(contacto, nombre) {
+  const fmt = s => (s || "").slice(0, 10).split("-").reverse().join("/");
+  const norm = s => String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   const r = await calendar.events.list({
     calendarId: CALENDAR_ID,
-    privateExtendedProperty: [`contacto=${contacto}`],
     timeMin: new Date(Date.now() - 86400000).toISOString(),
+    maxResults: 250,
     singleEvents: true,
+    orderBy: "startTime",
   });
-  const fmt = s => (s || "").slice(0, 10).split("-").reverse().join("/");
-  return (r.data.items || []).filter(e => e.status !== "cancelled").map(e => ({
+  const tokens = norm(nombre).split(/\s+/).filter(t => t.length > 2);
+  const digitos = String(contacto).replace(/\D/g, "");
+  return (r.data.items || []).filter(e => e.status !== "cancelled").filter(e => {
+    const p = e.extendedProperties?.private || {};
+    if (String(p.contacto) === String(contacto)) return true;
+    const texto = norm((e.summary || "") + " " + (e.description || ""));
+    if (digitos.length >= 8 && texto.replace(/\D/g, "").includes(digitos.slice(-10))) return true;
+    return tokens.length >= 2 ? tokens.filter(t => texto.includes(t)).length >= 2 : false;
+  }).map(e => ({
+    titulo: e.summary,
     llegada: fmt(e.start.dateTime || e.start.date),
     salida: fmt(e.end.dateTime || e.end.date),
-    estado: e.extendedProperties?.private?.estado || "pendiente",
+    estado: e.extendedProperties?.private?.estado || "agendada por el administrador",
   }));
 }
 
@@ -394,7 +405,7 @@ RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adult
 En "paquetes" pon los paquetes que le interesaron al cliente separados por coma (ej. "Fiesta Infantil, Karaoke"; marca los por cotizar asi: "Chef Privada (por cotizar)"); si ninguno, pon "Ninguno".
 Solo UNA vez por cada reserva confirmada (no la repitas si solo estan platicando de la misma reserva).
 
-EL CALENDARIO MANDA: lo que se hablo antes en esta conversacion puede estar desactualizado (el administrador puede cancelar o borrar reservas). Antes de decir que el cliente ya tiene una reserva, o si pregunta por su reserva o su pago, usa consultar_mis_reservas y confia SOLO en ese resultado. Si ahi no aparece, NO la tiene: tratala como reserva nueva (consulta disponibilidad, cotiza y genera un nuevo RESERVA_JSON cuando confirme). Nunca digas "ya la tenemos registrada" sin haberlo consultado.
+EL CALENDARIO MANDA: lo que se hablo antes en esta conversacion puede estar desactualizado (el administrador puede cancelar o borrar reservas). Antes de decir que el cliente ya tiene una reserva, o si pregunta por su reserva o su pago, usa consultar_mis_reservas y confia SOLO en ese resultado. Si el cliente dice que la reserva la hizo con el administrador, pasa su nombre completo en el campo nombre: tambien se buscan las reservas que el administrador agendo a mano. Si ahi no aparece, NO la tiene: tratala como reserva nueva (consulta disponibilidad, cotiza y genera un nuevo RESERVA_JSON cuando confirme). Nunca digas "ya la tenemos registrada" sin haberlo consultado.
 
 VARIAS RESERVAS: un mismo cliente puede hacer mas de una reserva. Si dice que quiere una reserva NUEVA u OTRA, o da fechas distintas a las de una reserva anterior, tratala como reserva nueva: pregunta las fechas y datos que falten (puedes reutilizar su nombre), consulta disponibilidad, cotiza y, cuando confirme, agrega un NUEVO RESERVA_JSON con las nuevas fechas. Nunca digas "ya la tenemos registrada" si las fechas son distintas.
 
@@ -432,7 +443,7 @@ async function responderConClaude(history, contacto) {
       let out;
       try {
         if (b.name === "consultar_mis_reservas") {
-          const lista = await reservasDelCliente(contacto);
+          const lista = await reservasDelCliente(contacto, b.input && b.input.nombre);
           out = { reservas: lista, nota: lista.length ? "Estas son sus unicas reservas vigentes" : "No tiene reservas vigentes (si hablaron de una antes, fue cancelada)" };
           console.log("Reservas de", contacto, ":", lista.length);
         } else {
@@ -600,6 +611,14 @@ function continuarContacto(id, nota) {
   });
 }
 app.get("/continuar/:id", async (req, res) => {
+  console.log("CONTINUAR solicitado para", req.params.id, "| origen:", req.get("user-agent") || "?");
+  const desdeManyChat = !/mozilla/i.test(req.get("user-agent") || "");
+  if (desdeManyChat) {
+    // ManyChat espera maximo ~10 s: se responde de inmediato y el mensaje se manda en segundo plano
+    res.json({ status: "ok", continuar: "iniciado" });
+    continuarContacto(req.params.id, req.query.nota || "").then(r => console.log("CONTINUAR resultado:", String(r).slice(0, 80)));
+    return;
+  }
   const r = await continuarContacto(req.params.id, req.query.nota || "");
   res.send("✅ El agente retomó la conversación con " + req.params.id + ".\n\nLe escribió: " + r);
 });
