@@ -345,7 +345,8 @@ DISTRIBUCION DE HABITACIONES (5 habitaciones, todas con aire acondicionado):
 4. Cama King Size + bano completo
 5. 2 Camas Matrimoniales + medio bano
 
-SERVICIOS: alberca climatizada 33-35C, horno de pizza, asador, gym, area de juegos, estacionamiento 4 autos, limpieza incluida.
+SERVICIOS: alberca climatizada 33-35C, horno de pizza, asador, gym, area de juegos, limpieza incluida.
+ESTACIONAMIENTO: 4 lugares dentro de la propiedad, y ademas hay mas espacio de estacionamiento afuera de la propiedad, con iluminacion y camaras de seguridad para tranquilidad de los huespedes. Si preguntan cuantos autos caben o si llegan varios autos, explica ambas opciones. Tambien mencionalo de forma natural como informacion adicional de la villa cuando describas la casa, sus servicios o amenidades, o cuando el grupo sea grande (mas de 8 personas).
 
 PAQUETES ADICIONALES (se cobran aparte de la renta; se suman al total de la reserva si el cliente los quiere):
 - Cumpleanos $1,500: recamara decorada con letrero "Feliz Cumpleanos" y globos en el techo, globos metalicos con los numeros de la edad en el color que elijan, pastel de Pizca de Azucar (mandamos 3 opciones de sabor) y bengala para la sorpresa.
@@ -652,19 +653,25 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         console.log("PLAN DE GRUPO recibido de", phoneNumber);
         mensajeCliente = FINAL_GRUPO + "\nPASAR_A_HUMANO";
       } else if (!pidePersona && (esGrupo || (grupoGrande.get(phoneNumber) && Date.now() - grupoGrande.get(phoneNumber) < 48 * 3600000))) {
-        // Grupo grande: 1) fechas  2) disponibilidad (doble verificacion)  3) preguntar el plan
-        const f = extraerFechas(message);
+        // Grupo grande: la IA contesta con todo el contexto; el codigo solo revisa fechas y disponibilidad
+        mensajeCliente = mensajeCliente.replace(/PASAR_A_HUMANO/g, "").trim();
+        let f = extraerFechas(message);
+        const enEsteMensaje = !!f;
+        if (!f && esGrupo) {
+          // Las fechas pudieron venir en un mensaje anterior (ej. "24 de diciembre" y despues "somos 20")
+          const previos = history.filter(h => h.role === "user" && typeof h.content === "string").slice(-8, -1).reverse();
+          for (const h of previos) { f = extraerFechas(h.content); if (f) break; }
+        }
+        if (esGrupo) grupoGrande.set(phoneNumber, Date.now());
         if (!f) {
-          grupoGrande.set(phoneNumber, Date.now());
-          mensajeCliente = "¡Qué gusto que quieran venir en grupo! 🌿 ¿Para qué fechas lo tienen pensado (llegada y salida)? Así reviso la disponibilidad 🗓️";
-          console.log("GRUPO GRANDE: pido fechas a", phoneNumber);
+          if (esGrupo && !/fecha|cu[aá]ndo|qu[eé] d[ií]a/i.test(mensajeCliente)) mensajeCliente += "\n\n¿Para qué fechas lo tienen pensado (llegada y salida)? Así reviso la disponibilidad 🗓️";
+          console.log("GRUPO GRANDE: sin fechas todavia", phoneNumber);
         } else {
           let disp = { disponible: true };
           try { disp = await consultarDisponibilidad(f.llegada, f.salida); } catch (e) { console.error("Disponibilidad grupo:", e.message); }
-          console.log("GRUPO GRANDE:", f.llegada, "-", f.salida, disp.disponible ? "LIBRE" : "OCUPADO", phoneNumber);
+          console.log("GRUPO GRANDE:", f.llegada, "-", f.salida, disp.disponible ? "LIBRE" : "OCUPADO", enEsteMensaje ? "(mensaje actual)" : "(mensaje anterior)", phoneNumber);
           if (!disp.disponible) {
-            grupoGrande.set(phoneNumber, Date.now());
-            mensajeCliente = `Revisé el calendario y del ${f.llegada} al ${f.salida} ya no tenemos disponibilidad 😔 ¿Te gustaría que revisemos otras fechas?`;
+            if (!/ocupad|no (hay|tenemos|contamos con|est[aá]n?) disponib|no est[aá]n? disponible|sin disponibilidad/i.test(mensajeCliente)) mensajeCliente = `Revisé el calendario y del ${f.llegada} al ${f.salida} ya no tenemos disponibilidad 😔 ¿Te gustaría que revisemos otras fechas para tu grupo?`;
           } else {
             grupoGrande.delete(phoneNumber);
             planGrupo.set(phoneNumber, Date.now());
