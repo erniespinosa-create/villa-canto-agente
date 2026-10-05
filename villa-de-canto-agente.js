@@ -91,6 +91,10 @@ function extraerFechas(texto) {
   return { llegada: fmt(a1[0], a1[1], y1), salida: fmt(a2[0], a2[1], y2) };
 }
 
+// Solo cuentan como reserva los eventos de color mostaza (o los que creo el agente). Configurable en Railway: COLORES_RESERVA="5,8"
+const COLORES_RESERVA = String(process.env.COLORES_RESERVA || "5,8").split(",").map(s => s.trim());
+const esReserva = e => !!(e.extendedProperties?.private?.estado) || COLORES_RESERVA.includes(String(e.colorId));
+
 async function consultarUnaVez(llegada, salida) {
   const r = await calendar.events.list({
     calendarId: CALENDAR_ID,
@@ -98,7 +102,9 @@ async function consultarUnaVez(llegada, salida) {
     timeMax: `${aISO(salida)}T12:00:00-06:00`,
     singleEvents: true,
   });
-  const ocupados = (r.data.items || []).filter(e => e.status !== "cancelled");
+  const todos = (r.data.items || []).filter(e => e.status !== "cancelled");
+  const ocupados = todos.filter(esReserva);
+  if (todos.length !== ocupados.length) console.log("Eventos ignorados (no son color de reserva):", todos.filter(e => !esReserva(e)).map(e => e.summary + " [color " + (e.colorId || "default") + "]").join(" | "));
   return { disponible: ocupados.length === 0, eventos: ocupados };
 }
 
@@ -301,7 +307,7 @@ async function reservasDelCliente(contacto, nombre) {
   });
   const tokens = norm(nombre).split(/\s+/).filter(t => t.length > 2);
   const digitos = String(contacto).replace(/\D/g, "");
-  return (r.data.items || []).filter(e => e.status !== "cancelled").filter(e => {
+  return (r.data.items || []).filter(e => e.status !== "cancelled" && esReserva(e)).filter(e => {
     const p = e.extendedProperties?.private || {};
     if (String(p.contacto) === String(contacto)) return true;
     const texto = norm((e.summary || "") + " " + (e.description || ""));
