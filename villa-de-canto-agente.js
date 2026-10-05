@@ -377,6 +377,8 @@ REGLAS:
 
 IDIOMA: responde SIEMPRE en el idioma en que te escribe el cliente (espanol, ingles, frances, etc.). Si cambia de idioma, cambia tu tambien. Manten los precios en pesos mexicanos (MXN) y las fechas en formato DD/MM/AAAA. Los marcadores internos (RESERVA_JSON, PASAR_A_HUMANO, FOTOS_CASA, FOTOS_PINATAS, etc.) se escriben siempre igual, sin traducir.
 
+MEMORIA: antes de preguntar cualquier cosa, revisa TODA la conversacion. NUNCA vuelvas a preguntar algo que el cliente ya dijo (nombre, fechas, numero de adultos o menores, motivo, paquetes, lo que pidio o pregunto). Si ya lo dijo, usalo y confirmalo brevemente (ej. "Entonces serian 8 adultos del 15 al 17 de noviembre, ¿correcto?"). Si un dato viene en un mensaje anterior, cuenta como dado. Si el administrador atendio al cliente, tu no viste esa parte: no pidas que te repita lo que ya pidio, usa lo que ya sabes y lo que te indiquen en la nota.
+
 TONO: calido, pausado, conversacional. Emojis ocasionales. Nunca robotico.
 
 LONGITUD: estas en WhatsApp. Responde CORTO, maximo 4-6 lineas por mensaje, como una persona. No mandes toda la informacion de golpe; da solo lo que pregunto y ofrece mas si lo quiere. Si el cliente pide "toda la informacion", da un resumen breve (ubicacion, capacidad, servicios, tarifas) en maximo 10 lineas, sin listar cada habitacion a menos que la pida. FORMATO WHATSAPP: para negritas usa UN solo asterisco (*texto*), nunca dos; no uses #, ni tablas.
@@ -495,7 +497,7 @@ app.post("/webhook", async (req, res) => {
   if (!phoneNumber || !message) return res.status(400).json({ error: "phoneNumber y message requeridos" });
 
   // Espera ESPERA_MS por si el cliente manda varios mensajes seguidos; solo el ultimo contesta con todo junto
-  if (String(message).startsWith("[SISTEMA]") || esReanudar(message)) return procesarMensaje(phoneNumber, telefono, message, res);
+  if (String(message).startsWith("[SISTEMA]") || esReanudar(message) || esReiniciar(message) || esContinuar(message)) return procesarMensaje(phoneNumber, telefono, message, res);
   const p = pendientes.get(phoneNumber) || { textos: [] };
   if (p.timer) { clearTimeout(p.timer); p.res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" }); }
   if (!p.textos.includes(String(message))) p.textos.push(String(message));
@@ -535,6 +537,20 @@ async function enviarPorManyChat(id, texto) {
 }
 const pendientes = new Map();
 const esReanudar = m => /^\W*(sistema\W*)?reanudar\W*$/i.test(String(m).trim());
+const esReiniciar = m => /^\W*(sistema\W*)?reiniciar\W*$/i.test(String(m).trim());
+function reiniciarContacto(id) {
+  db.run("DELETE FROM pausas WHERE id = ?", [id]);
+  db.run("DELETE FROM conversations WHERE id = ?", [id]);
+  db.run("DELETE FROM seguimiento WHERE id = ?", [id]);
+  planGrupo.delete(id); grupoGrande.delete(id); pendientes.delete(id);
+  console.log("Conversacion reiniciada para", id);
+}
+
+// Reiniciar desde el navegador: https://TU-APP.up.railway.app/reiniciar/ID_DEL_CONTACTO
+app.get("/reiniciar/:id", (req, res) => {
+  reiniciarContacto(req.params.id);
+  res.send("✅ Conversación reiniciada para " + req.params.id + ". El agente empieza de cero con ese contacto.");
+});
 
 // Reanudar desde el navegador: https://TU-APP.up.railway.app/reanudar/ID_DEL_CONTACTO
 app.get("/reanudar/:id", (req, res) => {
@@ -556,7 +572,47 @@ function anotarHistorial(id, texto, cb) {
 }
 const NOTA_REANUDAR = "[SISTEMA] El administrador de la villa ya atendio personalmente al cliente en este chat (tu no viste esa parte de la conversacion). Ya NO digas que lo vas a comunicar ni que el administrador le escribira. Si el cliente vuelve a escribir, retoma con naturalidad, como si fueras parte del mismo equipo: responde lo que pregunte y, si aplica, preguntale amablemente si quedo resuelto o si le ayudas con algo mas (fechas, cotizacion, paquetes).";
 
+// CONTINUAR: quita la pausa, el agente lee toda la conversacion y retoma el hilo escribiendole al cliente
+const esContinuar = m => /^\W*(sistema\W*)?continuar\b/i.test(String(m).trim());
+function continuarContacto(id, nota) {
+  return new Promise(resolve => {
+    db.run("DELETE FROM pausas WHERE id = ?", [id]);
+    const instruccion = "[SISTEMA] El administrador de la villa atendio personalmente al cliente en este chat y ahora te regresa la conversacion (tu no viste esa parte)." +
+      (nota ? " Lo que el administrador acordo o aviso: " + nota + "." : "") +
+      " Revisa TODA la conversacion anterior y escribele tu AHORA un mensaje corto, calido y natural al cliente para retomar donde se quedaron. PROHIBIDO volver a preguntarle lo que ya pidio o dijo (fechas, personas, paquete, motivo): resume en una frase lo que ya sabes (por ejemplo: Con gusto sigo con tu reserva de X adultos del ... al ...) y avanza al siguiente paso. No te presentes de nuevo, no digas que el administrador le escribira. Si faltan datos para su reserva (fechas, adultos, nombre), pide solo lo que falta; si ya estaba todo, preguntale si quedo resuelto o si le ayudas con algo mas.";
+    anotarHistorial(id, instruccion, () => {
+      db.get("SELECT messages FROM conversations WHERE id = ?", [id], async (err, row) => {
+        try {
+          const history = row ? JSON.parse(row.messages) : [];
+          let reply = await responderConClaude(history, id);
+          reply = String(reply).replace(/PASAR_A_HUMANO|FOTOS_CASA|FOTOS_PINATAS|RESERVA_JSON[\s\S]*$/g, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim();
+          if (!reply) return resolve("sin respuesta");
+          history.push({ role: "assistant", content: reply });
+          while (history.length > 40) history.shift();
+          while (history.length && history[0].role !== "user") history.shift();
+          db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))", [id, JSON.stringify(history)]);
+          await enviarPorManyChat(id, reply);
+          console.log("Agente CONTINUA la conversacion de", id);
+          resolve(reply);
+        } catch (e) { console.error("Continuar:", e.message); resolve("error: " + e.message); }
+      });
+    });
+  });
+}
+app.get("/continuar/:id", async (req, res) => {
+  const r = await continuarContacto(req.params.id, req.query.nota || "");
+  res.send("✅ El agente retomó la conversación con " + req.params.id + ".\n\nLe escribió: " + r);
+});
+
 function procesarMensaje(phoneNumber, telefono, message, res) {
+  if (esContinuar(message)) {
+    continuarContacto(phoneNumber, String(message).replace(/^\W*(sistema\W*)?continuar\b[\s:,.-]*/i, "").trim());
+    return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+  }
+  if (esReiniciar(message)) {
+    reiniciarContacto(phoneNumber);
+    return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+  }
   if (esReanudar(message)) {
     db.run("DELETE FROM pausas WHERE id = ?", [phoneNumber]);
     anotarHistorial(phoneNumber, NOTA_REANUDAR);
@@ -596,7 +652,7 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         enviado = true;
         console.log("Respuesta lenta, se enviara completa por API a", phoneNumber);
         // Sin mensaje intermedio: ManyChat recibe vacio (la condicion res_respuesta no esta vacio lo ignora) y la respuesta completa llega por API
-        res.json({ response: process.env.MENSAJE_ESPERA || "", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+        res.json({ response: process.env.MENSAJE_ESPERA || "🌿", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
       }, Math.max(300, LIMITE_MS - (Date.now() - (res.t0 || Date.now()))));
       let reply;
       try { reply = await responderConClaude(history, phoneNumber); }
@@ -715,7 +771,7 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
       if (!mensajeCliente.trim()) mensajeCliente = "Perfecto, ya quedo anotado 😊 ¿Algo mas en lo que te pueda ayudar?";
 
       history.push({ role: "assistant", content: reply });
-      if (history.length > 20) history.splice(0, history.length - 20);
+      if (history.length > 40) history.splice(0, history.length - 40);
       while (history.length && history[0].role !== "user") history.shift();
       db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))",
         [phoneNumber, JSON.stringify(history)]);
