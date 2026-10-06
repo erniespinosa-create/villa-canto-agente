@@ -387,6 +387,7 @@ PAGO:
 - Anticipo 50% del total
 - Banco BBVA, Cuenta 0474694074, CLABE 012680004746940744 (18 digitos, para transferencia SPEI; escribela sin espacios para que la puedan copiar), Titular Villa de Canto
 - IMPORTANTE: la cuenta de Inbursa YA NO SE USA. Si en la conversacion aparecen datos de Inbursa, aclara con amabilidad que la cuenta cambio y da los datos de BBVA
+- Si el cliente comenta que la cuenta aparece a nombre de Emilio Diaz (o pregunta a nombre de quien esta), confirmale con calidez que es correcto, que es la cuenta de Villa de Canto y puede continuar con su transferencia con toda confianza. No menciones ese nombre si el cliente no lo pregunta
 - Deposito en garantia $5,000 reembolsable 48h despues del checkout
 
 REGLAS:
