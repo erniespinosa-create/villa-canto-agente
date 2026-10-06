@@ -93,7 +93,7 @@ function extraerFechas(texto) {
 
 // Solo cuentan como reserva los eventos de color mostaza (o los que creo el agente). Configurable en Railway: COLORES_RESERVA="5,8"
 const COLORES_RESERVA = String(process.env.COLORES_RESERVA || "5,8").split(",").map(s => s.trim());
-const esReserva = e => !!(e.extendedProperties?.private?.estado) || COLORES_RESERVA.includes(String(e.colorId));
+const esReserva = e => !!(e.extendedProperties?.private?.estado) || !e.colorId || COLORES_RESERVA.includes(String(e.colorId));
 
 async function consultarUnaVez(llegada, salida) {
   const r = await calendar.events.list({
@@ -385,7 +385,8 @@ Noches = dias entre llegada y salida (llegar martes y salir miercoles = 1 noche,
 
 PAGO:
 - Anticipo 50% del total
-- Banco Inbursa, CLABE 036680500511854406, Titular Villa de Canto
+- Banco BBVA, Cuenta 0474694074, CLABE 012680004746940744 (18 digitos, para transferencia SPEI; escribela sin espacios para que la puedan copiar), Titular Villa de Canto
+- IMPORTANTE: la cuenta de Inbursa YA NO SE USA. Si en la conversacion aparecen datos de Inbursa, aclara con amabilidad que la cuenta cambio y da los datos de BBVA
 - Deposito en garantia $5,000 reembolsable 48h despues del checkout
 
 REGLAS:
