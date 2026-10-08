@@ -119,7 +119,7 @@ async function consultarDisponibilidad(llegada, salida) {
 }
 
 async function crearEventoCalendar(datos) {
-  if (Number(datos.adultos) > 15) return { excedido: true };
+  if (Number(datos.adultos || 0) + Number(datos.ninos || 0) > 20) return { excedido: true };
   const { disponible } = await consultarDisponibilidad(datos.llegada, datos.salida);
   if (!disponible) return { ocupado: true };
   const evento = await calendar.events.insert({
@@ -347,7 +347,7 @@ NUNCA INVENTES DATOS: usa solo lo que el cliente escribio literalmente. Si dice 
 DISPONIBILIDAD: en cuanto tengas fecha de llegada y de salida, usa la herramienta consultar_disponibilidad ANTES de cotizar. Si no esta disponible, dilo con calidez y ofrece buscar otras fechas. Nunca digas que hay disponibilidad sin haberla consultado.
 
 DATOS:
-- Capacidad: 15 ADULTOS maximo. LOS MENORES (ninos) NO CUENTAN para la capacidad ni tienen limite: nunca los menciones como problema, no cuentes menores contra la capacidad, no pases a humano por menores y no los uses para decir que es grupo grande. Solo si piden MAS DE 15 ADULTOS, dile con calidez que la capacidad regular es de 15 adultos y que para grupos mas grandes el administrador de la villa le dara una atencion personalizada. PRIMERO, si ya te dio fechas, usa consultar_disponibilidad (si estan OCUPADAS dile con calidez que no hay disponibilidad y ofrece otras fechas, sin PASAR_A_HUMANO). Solo con fechas LIBRES preguntale con calidez cual es el plan o que tiene en mente (tipo de evento o celebracion, fechas y numero total de personas) y agrega al FINAL, en su propia linea, PASAR_A_HUMANO (el sistema esperara su respuesta antes de avisar al administrador).
+- Capacidad y personas adicionales: se cuentan TODAS las personas (adultos + ninos). Hasta 15 personas en total: tarifa normal. De 16 a 20 personas en total: se cobran $750 MXN por cada persona adicional (las que pasen de 15) POR NOCHE. Ponlo en la cotizacion como linea aparte (ej. 18 personas por 2 noches: 3 personas adicionales x $750 x 2 noches = $4,500) y SUMALO al total de la renta (asi el anticipo del 50% tambien lo incluye) y al campo total del RESERVA_JSON. 20 personas es el maximo que puedes cotizar y apartar. Si son 21 PERSONAS O MAS en total, NO cotices ni apartes: dile con calidez que para grupos de mas de 20 personas el administrador de la villa le dara una atencion personalizada. PRIMERO, si ya te dio fechas, usa consultar_disponibilidad (si estan OCUPADAS dile con calidez que no hay disponibilidad y ofrece otras fechas, sin PASAR_A_HUMANO). Solo con fechas LIBRES preguntale con calidez cual es el plan o que tiene en mente (tipo de evento o celebracion, fechas y numero total de personas) y agrega al FINAL, en su propia linea, PASAR_A_HUMANO (el sistema esperara su respuesta antes de avisar al administrador).
 - Direccion: Boulevard Rodolfo Gaona 106, Campestre Amazcala
 - Check-in 13:00 | Check-out 12:00
 - Ubicacion en Google Maps: https://www.google.com/maps?q=20.6901757,-100.2620513
@@ -381,6 +381,7 @@ TARIFAS POR NOCHE (cada noche se cobra segun el dia en que se duerme):
 - Lunes a jueves y domingo: $10,500
 - Viernes: $12,000
 - Sabado: $14,000
+- Persona adicional (de la 16 a la 20, contando ninos): $750 por persona por noche
 Noches = dias entre llegada y salida (llegar martes y salir miercoles = 1 noche, la del martes).
 
 PAGO:
@@ -697,7 +698,7 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
           datos.telefono = (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber;
           const r = await crearEventoCalendar(datos);
           if (r.excedido) {
-            mensajeCliente += "\n\nUna aclaración 🙏 la villa tiene capacidad regular de 15 adultos (los menores no cuentan). Para grupos más grandes, el administrador de la villa te dará una atención personalizada 🌿 ¿Me cuentas cuál es el plan o qué tienen en mente?";
+            mensajeCliente += "\n\nUna aclaración 🙏 para grupos de más de 20 personas, el administrador de la villa te dará una atención personalizada 🌿 ¿Me cuentas cuál es el plan o qué tienen en mente?";
             planGrupo.set(phoneNumber, Date.now());
           } else if (r.ocupado) {
             mensajeCliente += "\n\nAy, justo acabo de revisar y esas fechas se acaban de ocupar 😔 ¿Buscamos otras fechas cercanas?";
@@ -729,9 +730,12 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
       }
       // Grupo mayor a la capacidad: se detecta en el codigo para no depender de la IA
       const txt = String(message).toLowerCase();
-      const nAdultos = Math.max(0, ...[...txt.matchAll(/(\d{1,3})\s*(adultos?|personas?|pax|invitados?|huespedes?|huéspedes?|gente)/g)].map(m => +m[1]));
-      const nNinos = Math.max(0, ...[...txt.matchAll(/(\d{1,3})\s*(niñ[oa]s?|nin[oa]s?|menores?)/g)].map(m => +m[1]));
-      const esGrupo = nAdultos > 15;
+      const maxNum = re => Math.max(0, ...[...txt.matchAll(re)].map(m => +m[1]));
+      const nAdultos = maxNum(/(\d{1,3})\s*adultos?/g);
+      const nPersonas = maxNum(/(\d{1,3})\s*(personas?|pax|invitados?|huespedes?|huéspedes?|gente)/g);
+      const nNinos = maxNum(/(\d{1,3})\s*(niñ[oa]s?|nin[oa]s?|menores?)/g);
+      const totalPersonas = Math.max(nPersonas, nAdultos + nNinos); // adultos + ninos
+      const esGrupo = totalPersonas > 20; // 16-20 se cotiza con $750 por persona adicional; 21+ al administrador
       const FINAL_GRUPO = "¡Muchas gracias por compartirnos su plan! 🌿 En breve el administrador de la villa se pondrá en contacto contigo para darte una atención personalizada. ¡Gracias!";
       const espera = planGrupo.get(phoneNumber);
       if (espera && Date.now() - espera < 48 * 3600000) {
@@ -761,24 +765,24 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
           } else {
             grupoGrande.delete(phoneNumber);
             planGrupo.set(phoneNumber, Date.now());
-            mensajeCliente = `¡Buenas noticias! 🎉 Sí tenemos disponibilidad del ${f.llegada} al ${f.salida}.\n\nLa villa tiene capacidad regular de 15 adultos (los menores no cuentan); para grupos más grandes el administrador de la villa te dará una atención personalizada. Para pasarle toda la información, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración y cuántas personas serían en total) 😊`;
+            mensajeCliente = `¡Buenas noticias! 🎉 Sí tenemos disponibilidad del ${f.llegada} al ${f.salida}.\n\nPara grupos de más de 20 personas, el administrador de la villa te dará una atención personalizada. Para pasarle toda la información, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración y cuántas personas serían en total) 😊`;
           }
         }
         reply = mensajeCliente;
       } else if (mensajeCliente.includes("PASAR_A_HUMANO") && !pidePersona && /ocupad|no (hay|tenemos|est[aá]n?) disponib/i.test(mensajeCliente)) {
         mensajeCliente = mensajeCliente.replace(/PASAR_A_HUMANO/g, "").trim();
         console.log("GRUPO GRANDE: fechas ocupadas, no se pasa al administrador", phoneNumber);
-      } else if (mensajeCliente.includes("PASAR_A_HUMANO") && !pidePersona && (nAdultos > 15 || /capacidad|grupo|15 adultos|personas en total|m[aá]s grande/i.test(mensajeCliente + " " + txt))) {
+      } else if (mensajeCliente.includes("PASAR_A_HUMANO") && !pidePersona && (totalPersonas > 20 || /capacidad|grupo|20 personas|personas en total|m[aá]s grande/i.test(mensajeCliente + " " + txt))) {
         mensajeCliente = mensajeCliente.replace(/PASAR_A_HUMANO/g, "").trim();
         if (!/plan|tienen en mente|evento|celebraci/i.test(mensajeCliente)) mensajeCliente += "\n\nPara pasarle toda la información al administrador, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración, fechas y cuántas personas serían en total) 😊";
         planGrupo.set(phoneNumber, Date.now());
         console.log("GRUPO GRANDE (IA): pregunto el plan a", phoneNumber);
-      } else if ((nAdultos > 15) && !mensajeCliente.includes("PASAR_A_HUMANO") && /ocupad|no (hay|tenemos|est[aá]n?) disponib|otras fechas|qu[eé] fechas|cu[aá]les fechas/i.test(mensajeCliente)) {
+      } else if ((totalPersonas > 20) && !mensajeCliente.includes("PASAR_A_HUMANO") && /ocupad|no (hay|tenemos|est[aá]n?) disponib|otras fechas|qu[eé] fechas|cu[aá]les fechas/i.test(mensajeCliente)) {
         // La IA ya contesto sobre disponibilidad/fechas (ocupadas o faltan fechas): se respeta su respuesta
         console.log("GRUPO GRANDE: esperando fechas libres de", phoneNumber);
-      } else if ((nAdultos > 15) && !mensajeCliente.includes("PASAR_A_HUMANO")) {
-        console.log("GRUPO GRANDE:", nAdultos, "adultos /", nNinos, "ninos de", phoneNumber);
-        mensajeCliente = "¡Qué gusto que quieran venir en grupo! 🌿 La villa tiene capacidad regular de 15 adultos (los menores no cuentan). Para grupos más grandes, el administrador de la villa te dará una atención personalizada. Para pasarle toda la información, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración, fechas y cuántas personas serían en total) 😊";
+      } else if ((totalPersonas > 20) && !mensajeCliente.includes("PASAR_A_HUMANO")) {
+        console.log("GRUPO GRANDE:", totalPersonas, "personas (", nAdultos, "adultos /", nNinos, "ninos ) de", phoneNumber);
+        mensajeCliente = "¡Qué gusto que quieran venir en grupo! 🌿 Para grupos de más de 20 personas, el administrador de la villa te dará una atención personalizada. Para pasarle toda la información, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración, fechas y cuántas personas serían en total) 😊";
         planGrupo.set(phoneNumber, Date.now());
       }
       let avisoHumano = "no";
