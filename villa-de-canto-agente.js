@@ -220,6 +220,7 @@ async function liberarPendientes() {
   for (const e of r.data.items || []) {
     if (Date.now() - new Date(e.created).getTime() < horas * 3600000) continue;
     const p = e.extendedProperties?.private || {};
+    if (p.pago === "avisado") continue; // ya mando su comprobante: no se libera, lo confirma el administrador
     const fmt = s => (s || "").slice(0, 10).split("-").reverse().join("/");
     try {
       await calendar.events.delete({ calendarId: CALENDAR_ID, eventId: e.id });
@@ -231,6 +232,70 @@ async function liberarPendientes() {
       }
     } catch (err) { console.error("Error liberando:", err.message); }
   }
+}
+
+// Recordatorio de cotizacion: si pidio precio y dejo de contestar, el agente le escribe ~20 h despues de su ultimo mensaje
+// (dentro de las 24 h en que WhatsApp permite mensajes libres). Nunca de noche: si toca entre 21:00 y 9:00,
+// se adelanta a las 20:30 de la tarde anterior. Si dijo que no, ya no se le recuerda.
+const MX = 6 * 3600000; // Ciudad de Mexico: UTC-6 todo el ano
+const dbGet = (sql, args) => new Promise(ok => db.get(sql, args, (e, r) => ok(e ? null : r)));
+function horaRecordatorio(creado) {
+  const ideal = creado + Number(process.env.HORAS_RECORDATORIO_PAGO || 20) * 3600000;
+  const loc = new Date(ideal - MX), h = loc.getUTCHours() + loc.getUTCMinutes() / 60;
+  if (h >= 9 && h < 21) return ideal;
+  if (h < 9) loc.setUTCDate(loc.getUTCDate() - 1);
+  loc.setUTCHours(20, 30, 0, 0);
+  return loc.getTime() + MX;
+}
+async function marcarAvisoPago(contacto) {
+  const r = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: [`contacto=${contacto}`, "estado=pendiente"], singleEvents: true });
+  for (const e of (r.data.items || []).filter(x => x.status !== "cancelled")) {
+    await calendar.events.patch({ calendarId: CALENDAR_ID, eventId: e.id, resource: { extendedProperties: { private: { ...(e.extendedProperties?.private || {}), pago: "avisado" } } } });
+  }
+}
+async function enviarRecordatorios() {
+  if (!process.env.MANYCHAT_API_KEY) return;
+  const ahora = Date.now(), loc = new Date(ahora - MX), hora = loc.getUTCHours() + loc.getUTCMinutes() / 60;
+  if (hora < 9 || hora >= 21) return; // nunca de noche
+  // Cotizaciones sin respuesta: recordatorio para quien pidio precio y dejo de contestar
+  const cots = await new Promise(ok => db.all("SELECT * FROM cotizaciones WHERE recordatorio IS NULL", [], (e, r2) => ok(e ? [] : r2 || [])));
+  for (const q of cots) {
+    if (await dbGet("SELECT id FROM no_recordar WHERE id = ?", [q.id])) { db.run("UPDATE cotizaciones SET recordatorio = 'no' WHERE id = ?", [q.id]); continue; }
+    const pausa = await dbGet("SELECT hasta FROM pausas WHERE id = ?", [q.id]);
+    if (pausa && pausa.hasta > ahora) continue;
+    try { const out = await recordarCotizacion(q); if (!String(out).startsWith("esperando")) console.log("Recordatorio de cotizacion", q.id, "->", String(out).slice(0, 120)); }
+    catch (err) { console.error("Recordatorio de cotizacion:", err.message); }
+  }
+}
+async function recordarCotizacion(q, forzar) {
+  const conv = await dbGet("SELECT messages, updated_at FROM conversations WHERE id = ?", [q.id]);
+  const ultimo = conv ? new Date(String(conv.updated_at).replace(" ", "T") + "Z").getTime() : q.creado;
+  const marcar = estado => db.run("UPDATE cotizaciones SET recordatorio = ? WHERE id = ?", [estado, q.id]);
+  if (!forzar && Date.now() < horaRecordatorio(ultimo)) return "esperando (el cliente escribio hace poco)";
+  if (!forzar && Date.now() - ultimo > 23 * 3600000) { marcar("sin_ventana"); return "no enviado (pasaron mas de 24 h desde su ultimo mensaje)"; }
+  if (aISO(q.llegada) <= new Date(Date.now() - MX).toISOString().slice(0, 10)) { marcar("vencida"); return "no enviado (la fecha ya paso)"; }
+  const ev = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: [`contacto=${q.id}`], timeMin: new Date().toISOString(), singleEvents: true, maxResults: 1 });
+  if (!forzar && (ev.data.items || []).length) { marcar("aparto"); return "no enviado (ya tiene reserva)"; }
+  const { disponible } = await consultarDisponibilidad(q.llegada, q.salida);
+  if (!disponible) { marcar("ocupada"); return "no enviado (esas fechas ya se ocuparon)"; }
+  const history = conv ? JSON.parse(conv.messages) : [];
+  const nota = `[SISTEMA] RECORDATORIO_COTIZACION (no lo escribio el cliente). Le cotizaste la villa del ${q.llegada} al ${q.salida} y dejo de contestar. Escribele TU ahora un mensaje corto (2 a 4 lineas), calido y sin presionar, en el idioma de la conversacion, para retomar, por ejemplo: "¿Seguimos con tu reserva? 🌿". Cuentale que esas fechas siguen disponibles por ahora, pero que no quedan apartadas hasta recibir el anticipo y el deposito en garantia, asi que otra persona podria reservarlas. Ofrecele resolver dudas o ajustar la cotizacion. No repitas la cotizacion completa, no te presentes de nuevo, no saludes como reencuentro y nunca digas SISTEMA.`;
+  const last = history[history.length - 1];
+  if (last && last.role === "user") last.content = String(last.content) + "\n" + nota; else history.push({ role: "user", content: nota });
+  let reply = "";
+  try { reply = await responderConClaude(history, q.id); } catch (err) { console.error("Recordatorio cotizacion (Claude):", err.message); }
+  reply = String(reply).replace(/COTIZACION_JSON:\{.*?\}|NO_INTERESADO|RESERVA_JSON[\s\S]*$|PASAR_A_HUMANO|FOTOS_CASA|FOTOS_PINATAS|ENVIAR_FOTOS|AVISO_PAGO/g, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim();
+  if (!reply || /^Dame un momento/.test(reply)) reply = `¿Seguimos con tu reserva del ${q.llegada} al ${q.salida}? 🌿 Esas fechas siguen disponibles por ahora, pero se apartan hasta recibir el anticipo y el depósito en garantía. Si tienes alguna duda o quieres ajustar algo, aquí estoy 😊`;
+  marcar("enviando");
+  const d = await textoWA(q.id, reply);
+  if (d.status !== "success") { marcar("fallido"); return "no enviado: " + JSON.stringify(d); }
+  history.push({ role: "assistant", content: reply });
+  while (history.length > 40) history.shift();
+  while (history.length && history[0].role !== "user") history.shift();
+  db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))", [q.id, JSON.stringify(history)]);
+  marcar("enviado");
+  await bitacora("Recordatorio de cotizacion", { telefono: q.id, llegada: q.llegada, salida: q.salida, total: q.total });
+  return "enviado: " + reply;
 }
 
 // 5) Mensaje 1 dia antes de la llegada (plantilla de ManyChat)
@@ -250,13 +315,14 @@ async function enviarPreLlegada() {
   }
 }
 
-// Recordatorio a los 5 dias: clientes que dejaron de contestar y no tienen reserva
+// Recordatorio a los 5 dias: SOLO a quien pidio cotizacion con fechas, dejo de contestar y no tiene reserva
 async function enviarSeguimientos() {
   if (!process.env.MANYCHAT_API_KEY || !process.env.MANYCHAT_FLOW_SEGUIMIENTO) return;
   const filas = await new Promise(ok => db.all(
     `SELECT c.id, c.updated_at FROM conversations c LEFT JOIN seguimiento s ON s.id = c.id
      WHERE c.updated_at <= datetime('now','-5 days') AND c.updated_at > datetime('now','-10 days')
-     AND (s.enviado_para IS NULL OR s.enviado_para <> c.updated_at)`, [], (e, r) => ok(e ? [] : r || [])));
+     AND (s.enviado_para IS NULL OR s.enviado_para <> c.updated_at) AND c.id NOT IN (SELECT id FROM no_recordar)
+     AND c.id IN (SELECT id FROM cotizaciones)`, [], (e, r) => ok(e ? [] : r || [])));
   for (const f of filas) {
     try {
       const r = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: [`contacto=${f.id}`], singleEvents: true, maxResults: 1 });
@@ -324,6 +390,8 @@ async function reservasDelCliente(contacto, nombre) {
 const db = new sqlite3.Database(path.join(process.env.DB_DIR || "/tmp", "conversations.db"));
 db.run("CREATE TABLE IF NOT EXISTS seguimiento (id TEXT PRIMARY KEY, enviado_para TEXT)");
 db.run("CREATE TABLE IF NOT EXISTS pausas (id TEXT PRIMARY KEY, hasta INTEGER)");
+db.run("CREATE TABLE IF NOT EXISTS cotizaciones (id TEXT PRIMARY KEY, llegada TEXT, salida TEXT, total REAL, creado INTEGER, recordatorio TEXT)");
+db.run("CREATE TABLE IF NOT EXISTS no_recordar (id TEXT PRIMARY KEY)");
 db.run(`CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   messages TEXT,
@@ -336,7 +404,9 @@ function hoyMexico() {
 }
 
 function systemPrompt() {
-  return `Eres Canto, el asistente de Villa de Canto en Amazcala, El Marques, Queretaro.
+  return `Eres Vero, la asistente de Villa de Canto en Amazcala, El Marques, Queretaro.
+
+PRESENTACION: en tu PRIMER mensaje de cada conversacion (cuando aun no has escrito nada en el historial) presentate por tu nombre, breve y calida, en el idioma del cliente. Ejemplo: "¡Hola! Soy Vero, de Villa de Canto 🌿 Qué gusto que nos escribas." Si en ese primer mensaje el cliente ya pregunto algo o te dio datos, presentate y respondele en el mismo mensaje. Hazlo solo una vez: despues no repitas tu nombre ni vuelvas a presentarte. Cuando hables de ti usa femenino (encantada, con gusto).
 
 FECHA DE HOY: ${hoyMexico()} (usa esto para resolver "manana", "el viernes", "este fin de semana", etc. sin preguntar)
 
@@ -417,6 +487,10 @@ RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adult
 En "paquetes" pon los paquetes que le interesaron al cliente separados por coma (ej. "Fiesta Infantil, Karaoke"; marca los por cotizar asi: "Chef Privada (por cotizar)"); si ninguno, pon "Ninguno".
 Solo UNA vez por cada reserva confirmada (no la repitas si solo estan platicando de la misma reserva).
 
+COTIZACION: solo cuando presentes una cotizacion para fechas concretas de llegada y salida que te dio el cliente (si solo pregunta precios en general, NO lo agregues), agrega al FINAL de tu respuesta, en su propia linea (el cliente no lo vera): COTIZACION_JSON:{"llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","total":N}
+
+SI DICE QUE NO: si el cliente dice que ya no le interesa, que no va a reservar, que ya reservo en otro lugar o que no le escriban, respondele con calidez y sin insistir (agradece y dejale la puerta abierta), y agrega al FINAL, en su propia linea: NO_INTERESADO. Si solo dice que lo va a pensar o que despues te avisa, NO lo uses.
+
 EL CALENDARIO MANDA: lo que se hablo antes en esta conversacion puede estar desactualizado (el administrador puede cancelar o borrar reservas). Antes de decir que el cliente ya tiene una reserva, o si pregunta por su reserva o su pago, usa consultar_mis_reservas y confia SOLO en ese resultado. Si el cliente dice que la reserva la hizo con el administrador, pasa su nombre completo en el campo nombre: tambien se buscan las reservas que el administrador agendo a mano. Si ahi no aparece, NO la tiene: tratala como reserva nueva (consulta disponibilidad, cotiza y genera un nuevo RESERVA_JSON cuando confirme). Nunca digas "ya la tenemos registrada" sin haberlo consultado.
 
 VARIAS RESERVAS: un mismo cliente puede hacer mas de una reserva. Si dice que quiere una reserva NUEVA u OTRA, o da fechas distintas a las de una reserva anterior, tratala como reserva nueva: pregunta las fechas y datos que falten (puedes reutilizar su nombre), consulta disponibilidad, cotiza y, cuando confirme, agrega un NUEVO RESERVA_JSON con las nuevas fechas. Nunca digas "ya la tenemos registrada" si las fechas son distintas.
@@ -473,7 +547,7 @@ async function responderConClaude(history, contacto) {
   return "Dame un momento, estoy revisando la disponibilidad y te confirmo enseguida 😊";
 }
 
-app.get("/", (req, res) => res.json({ status: "ok", agente: "Canto" }));
+app.get("/", (req, res) => res.json({ status: "ok", agente: "Vero" }));
 
 app.get("/privacidad", (req, res) => res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aviso de privacidad - Villa de Canto</title></head>
 <body style="font-family:Arial,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#201e1d">
@@ -565,6 +639,8 @@ function reiniciarContacto(id) {
   db.run("DELETE FROM pausas WHERE id = ?", [id]);
   db.run("DELETE FROM conversations WHERE id = ?", [id]);
   db.run("DELETE FROM seguimiento WHERE id = ?", [id]);
+  db.run("DELETE FROM cotizaciones WHERE id = ?", [id]);
+  db.run("DELETE FROM no_recordar WHERE id = ?", [id]);
   planGrupo.delete(id); grupoGrande.delete(id); pendientes.delete(id);
   console.log("Conversacion reiniciada para", id);
 }
@@ -608,7 +684,7 @@ function continuarContacto(id, nota) {
         try {
           const history = row ? JSON.parse(row.messages) : [];
           let reply = await responderConClaude(history, id);
-          reply = String(reply).replace(/PASAR_A_HUMANO|FOTOS_CASA|FOTOS_PINATAS|RESERVA_JSON[\s\S]*$/g, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim();
+          reply = String(reply).replace(/COTIZACION_JSON:\{.*?\}|NO_INTERESADO|PASAR_A_HUMANO|FOTOS_CASA|FOTOS_PINATAS|RESERVA_JSON[\s\S]*$/g, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim();
           if (!reply) return resolve("sin respuesta");
           history.push({ role: "assistant", content: reply });
           while (history.length > 40) history.shift();
@@ -710,11 +786,23 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
           console.error("Error creando evento de Calendar:", e.message);
         }
       }
+      const cot = mensajeCliente.match(/COTIZACION_JSON:(\{.*?\})/);
+      if (cot) {
+        mensajeCliente = mensajeCliente.replace(cot[0], "").trim();
+        try { const q = JSON.parse(cot[1]); const f = v => String(v || "").trim().replace(/-/g, "/"), esFecha = v => /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(v); q.llegada = f(q.llegada); q.salida = f(q.salida); if (!esFecha(q.llegada) || !esFecha(q.salida)) throw new Error("sin fechas, no se guarda"); db.run("INSERT OR REPLACE INTO cotizaciones (id, llegada, salida, total, creado, recordatorio) VALUES (?, ?, ?, ?, ?, NULL)", [phoneNumber, q.llegada, q.salida, q.total || 0, Date.now()]); db.run("DELETE FROM no_recordar WHERE id = ?", [phoneNumber]); console.log("Cotizacion guardada", phoneNumber, q.llegada, "-", q.salida); }
+        catch (e) { console.error("Cotizacion:", e.message); }
+      }
+      if (mensajeCliente.includes("NO_INTERESADO")) {
+        mensajeCliente = mensajeCliente.replace(/NO_INTERESADO/g, "").trim();
+        db.run("INSERT OR REPLACE INTO no_recordar (id) VALUES (?)", [phoneNumber]);
+        console.log("NO INTERESADO: ya no se le mandan recordatorios a", phoneNumber);
+      }
       let avisoPago = "no";
       if (mensajeCliente.includes("AVISO_PAGO")) {
         avisoPago = "si";
         mensajeCliente = mensajeCliente.replace(/AVISO_PAGO/g, "").trim();
         console.log("AVISO DE PAGO de", phoneNumber);
+        marcarAvisoPago(phoneNumber).catch(e => console.error("Marcar aviso de pago:", e.message));
         await bitacora("Aviso de pago", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber });
       }
       let enviarFotos = "no";
@@ -841,7 +929,17 @@ app.get("/probar-resena/:id", async (req, res) => {
   } catch (e) { res.send("❌ Error: " + e.message); }
 });
 
-const server = app.listen(PORT, () => console.log(`Agente Canto en puerto ${PORT}`));
+// Prueba del recordatorio de cotizacion: abrir /probar-recordatorio/ID_DEL_CONTACTO (ese contacto debe haber pedido una cotizacion)
+app.get("/probar-recordatorio/:id", async (req, res) => {
+  try {
+    const q = await dbGet("SELECT * FROM cotizaciones WHERE id = ?", [req.params.id]);
+    if (!q) return res.send("❌ Ese contacto no tiene cotización guardada. Pide una cotización desde WhatsApp y vuelve a abrir este link.");
+    const out = await recordarCotizacion(q, true);
+    res.send((out.startsWith("enviado") ? "✅ Recordatorio enviado. Revisa tu WhatsApp.\n\n" : "❌ ") + out);
+  } catch (err) { res.send("❌ Error: " + err.message); }
+});
+
+const server = app.listen(PORT, () => console.log(`Agente Vero en puerto ${PORT}`));
 setInterval(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 60 * 60 * 1000);
 setTimeout(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 30000);
 setInterval(() => liberarPendientes().catch(e => console.error("Liberar:", e.message)), 60 * 60 * 1000);
@@ -849,6 +947,8 @@ setInterval(() => enviarPreLlegada().catch(e => console.error("Pre-llegada:", e.
 setTimeout(() => { liberarPendientes().catch(() => {}); enviarPreLlegada().catch(() => {}); }, 90000);
 setInterval(() => enviarSeguimientos().catch(e => console.error("Seguimiento:", e.message)), 60 * 60 * 1000);
 setTimeout(() => enviarSeguimientos().catch(e => console.error("Seguimiento:", e.message)), 60000);
+setInterval(() => enviarRecordatorios().catch(e => console.error("Recordatorio de cotizacion:", e.message)), 15 * 60 * 1000);
+setTimeout(() => enviarRecordatorios().catch(e => console.error("Recordatorio de cotizacion:", e.message)), 120000);
 process.on("SIGTERM", () => {
   console.log("Apagando para nueva version...");
   server.close(() => db.close(() => process.exit(0)));
