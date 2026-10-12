@@ -234,17 +234,21 @@ async function liberarPendientes() {
   }
 }
 
-// Recordatorio de cotizacion: si pidio precio y dejo de contestar, el agente le escribe ~20 h despues de su ultimo mensaje
-// (dentro de las 24 h en que WhatsApp permite mensajes libres). Nunca de noche: si toca entre 21:00 y 9:00,
-// se adelanta a las 20:30 de la tarde anterior. Si dijo que no, ya no se le recuerda.
+// Recordatorio de cotizacion: si ya le dijimos que hay disponibilidad y dejo de contestar, el agente le escribe ~12 h
+// despues de su ultimo mensaje. Si eso cae de noche (21:00 a 9:00), se pasa a las 10:00 de la manana siguiente.
+// Si las 10:00 ya quedan fuera de las 24 h en que WhatsApp permite mensajes libres, se manda a las 20:30 de ese dia.
+// Si dijo que no, ya no se le recuerda.
 const MX = 6 * 3600000; // Ciudad de Mexico: UTC-6 todo el ano
 const dbGet = (sql, args) => new Promise(ok => db.get(sql, args, (e, r) => ok(e ? null : r)));
 function horaRecordatorio(creado) {
-  const ideal = creado + Number(process.env.HORAS_RECORDATORIO_PAGO || 20) * 3600000;
+  const ideal = creado + Number(process.env.HORAS_RECORDATORIO_COTIZACION || 12) * 3600000;
   const loc = new Date(ideal - MX), h = loc.getUTCHours() + loc.getUTCMinutes() / 60;
   if (h >= 9 && h < 21) return ideal;
-  if (h < 9) loc.setUTCDate(loc.getUTCDate() - 1);
-  loc.setUTCHours(20, 30, 0, 0);
+  const manana = new Date(loc);
+  if (h >= 21) manana.setUTCDate(manana.getUTCDate() + 1);
+  manana.setUTCHours(Number(process.env.HORA_RECORDATORIO_MANANA || 10), 0, 0, 0);
+  if (manana.getTime() + MX - creado <= 22.5 * 3600000) return manana.getTime() + MX;
+  loc.setUTCHours(20, 30, 0, 0); // la manana ya queda fuera de las 24 h: mejor esa misma tarde
   return loc.getTime() + MX;
 }
 async function marcarAvisoPago(contacto) {
@@ -279,13 +283,14 @@ async function recordarCotizacion(q, forzar) {
   const { disponible } = await consultarDisponibilidad(q.llegada, q.salida);
   if (!disponible) { marcar("ocupada"); return "no enviado (esas fechas ya se ocuparon)"; }
   const history = conv ? JSON.parse(conv.messages) : [];
-  const nota = `[SISTEMA] RECORDATORIO_COTIZACION (no lo escribio el cliente). Le cotizaste la villa del ${q.llegada} al ${q.salida} y dejo de contestar. Escribele TU ahora un mensaje corto (2 a 4 lineas), calido y sin presionar, en el idioma de la conversacion, para retomar, por ejemplo: "¿Seguimos con tu reserva? 🌿". Cuentale que esas fechas siguen disponibles por ahora, pero que no quedan apartadas hasta recibir el anticipo y el deposito en garantia, asi que otra persona podria reservarlas. Ofrecele resolver dudas o ajustar la cotizacion. No repitas la cotizacion completa, no te presentes de nuevo, no saludes como reencuentro y nunca digas SISTEMA.`;
+  const hl = new Date(Date.now() - MX).getUTCHours(), saludo = hl < 12 ? "Buenos días" : hl < 19 ? "Buenas tardes" : "Buenas noches";
+  const nota = `[SISTEMA] RECORDATORIO_COTIZACION (no lo escribio el cliente). Le dijiste que la villa esta disponible del ${q.llegada} al ${q.salida}, le cotizaste y dejo de contestar. Escribele TU ahora un mensaje corto (2 a 4 lineas), calido y sin presionar, en el idioma de la conversacion. Empieza con "${saludo}" y su nombre si lo sabes, y preguntale si quiere continuar con su reserva, por ejemplo: "¿Te gustaría continuar con tu reserva? 🌿". Cuentale que esas fechas siguen disponibles por ahora, pero que no quedan apartadas hasta recibir el anticipo y el deposito en garantia, asi que otra persona podria reservarlas. Ofrecele resolver dudas o ajustar la cotizacion. No repitas la cotizacion completa, no te presentes de nuevo, no saludes como reencuentro y nunca digas SISTEMA.`;
   const last = history[history.length - 1];
   if (last && last.role === "user") last.content = String(last.content) + "\n" + nota; else history.push({ role: "user", content: nota });
   let reply = "";
   try { reply = await responderConClaude(history, q.id); } catch (err) { console.error("Recordatorio cotizacion (Claude):", err.message); }
   reply = String(reply).replace(/COTIZACION_JSON:\{.*?\}|NO_INTERESADO|RESERVA_JSON[\s\S]*$|PASAR_A_HUMANO|FOTOS_CASA|FOTOS_PINATAS|ENVIAR_FOTOS|AVISO_PAGO/g, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim();
-  if (!reply || /^Dame un momento/.test(reply)) reply = `¿Seguimos con tu reserva del ${q.llegada} al ${q.salida}? 🌿 Esas fechas siguen disponibles por ahora, pero se apartan hasta recibir el anticipo y el depósito en garantía. Si tienes alguna duda o quieres ajustar algo, aquí estoy 😊`;
+  if (!reply || /^Dame un momento/.test(reply)) reply = `${saludo} 🌿 ¿Te gustaría continuar con tu reserva del ${q.llegada} al ${q.salida}? Esas fechas siguen disponibles por ahora, pero se apartan hasta recibir el anticipo y el depósito en garantía. Si tienes alguna duda o quieres ajustar algo, aquí estoy 😊`;
   marcar("enviando");
   const d = await textoWA(q.id, reply);
   if (d.status !== "success") { marcar("fallido"); return "no enviado: " + JSON.stringify(d); }
