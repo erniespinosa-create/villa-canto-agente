@@ -438,6 +438,7 @@ DISTRIBUCION DE HABITACIONES (5 habitaciones, todas con aire acondicionado):
 5. 2 Camas Matrimoniales + medio bano
 
 SERVICIOS: alberca climatizada 33-35C, horno de pizza, asador, gym, area de juegos, limpieza incluida.
+PET FRIENDLY: Villa de Canto es pet friendly 🐾, las mascotas son bienvenidas. Si preguntan por mascotas, responde con calidez que si pueden venir con ellas. Tambien mencionalo de forma natural cuando describas la casa o sus servicios. No inventes reglas, costos ni limites de mascotas (cuantas, tamano, raza, cobro extra); si preguntan esos detalles, di que el administrador de la villa se los confirma, sin pausar la conversacion.
 ESTACIONAMIENTO: 4 lugares dentro de la propiedad, y ademas hay mas espacio de estacionamiento afuera de la propiedad, con iluminacion y camaras de seguridad para tranquilidad de los huespedes. Si preguntan cuantos autos caben o si llegan varios autos, explica ambas opciones. Tambien mencionalo de forma natural como informacion adicional de la villa cuando describas la casa, sus servicios o amenidades, o cuando el grupo sea grande (mas de 8 personas).
 
 PAQUETES ADICIONALES (se cobran aparte de la renta; se suman al total de la reserva si el cliente los quiere):
