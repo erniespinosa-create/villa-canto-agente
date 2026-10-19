@@ -213,6 +213,67 @@ async function manychat(ruta, body) {
 }
 const textoWA = (subscriber_id, text) => manychat("sendContent", { subscriber_id, data: { version: "v2", content: { type: "whatsapp", messages: [{ type: "text", text }] } } });
 
+// Aviso por WhatsApp a los administradores (plantilla de ManyChat) cuando un huesped necesita atencion.
+// AVISO_ADMINS = codigos de contacto de ManyChat separados por coma (cada admin lo obtiene escribiendo ACTIVAR AVISOS)
+const ADMINS_AVISO = String(process.env.AVISO_ADMINS || "").split(/[\s,;]+/).filter(Boolean);
+const avisosEnviados = new Map(); // admin -> hora del ultimo aviso (para no contestarle su "ok")
+const URL_PUBLICA = process.env.URL_PUBLICA || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : "https://villa-canto-agente-production.up.railway.app");
+async function avisarAdmins({ id, telefono, texto, nombre }) {
+  const info = id ? await infoContacto(id) : {};
+  nombre = nombre || info.name || [info.first_name, info.last_name].filter(Boolean).join(" ") || "Un huésped";
+  const d = String(info.whatsapp_phone || (telefono && !String(telefono).includes("{{") ? telefono : "")).replace(/\D/g, "").slice(-10);
+  const telF = d.length === 10 ? `${d.slice(0, 3)} ${d.slice(3, 6)} ${d.slice(6)}` : "";
+  const tel = telF ? ` (${telF})` : "";
+  const dijo = String(texto || "").replace(/\s+/g, " ").trim().slice(0, 180);
+  // Grupo de WhatsApp de los administradores (via Whapi.cloud): WHAPI_TOKEN y WHAPI_GRUPO en Railway
+  if (process.env.WHAPI_TOKEN && process.env.WHAPI_GRUPO) {
+    const mensaje = [
+      "🔔 *Villa de Canto · un huésped necesita atención*",
+      "",
+      `👤 ${nombre}`,
+      telF ? `📱 ${telF}` : null,
+      `💬 "${dijo || "Quiere hablar con el administrador"}"`,
+      "",
+      "⏸️ Vero quedó en pausa con este huésped. Contesten desde el WhatsApp de la villa (442 874 2383).",
+      id ? `▶️ Para reactivar a Vero: ${URL_PUBLICA}/reanudar/${id}` : null,
+    ].filter(x => x != null).join("\n");
+    try {
+      const r = await fetch("https://gate.whapi.cloud/messages/text", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.WHAPI_TOKEN.trim()}` },
+        body: JSON.stringify({ to: process.env.WHAPI_GRUPO.trim(), body: mensaje }),
+      });
+      const c = await r.json().catch(() => ({}));
+      if (!r.ok || c.sent === false) { console.error("Aviso al grupo:", r.status, JSON.stringify(c)); return [`❌ Grupo: ${r.status} ${JSON.stringify(c).slice(0, 300)}`]; }
+      console.log("Aviso enviado al grupo de administradores");
+      return ["✅ Aviso enviado al grupo"];
+    } catch (e) { console.error("Aviso al grupo:", e.message); return [`❌ Grupo: ${e.message}`]; }
+  }
+  if (!process.env.MANYCHAT_API_KEY || !process.env.MANYCHAT_FLOW_AVISO || !ADMINS_AVISO.length) {
+    console.log("Aviso sin configurar: faltan WHAPI_TOKEN y WHAPI_GRUPO en Railway");
+    return ["❌ Faltan WHAPI_TOKEN y WHAPI_GRUPO en Railway"];
+  }
+  const valor = `${nombre}${tel} escribió: ${dijo || "quiere hablar con el administrador"}`.replace(/\s+/g, " ").replace(/[.\s]+$/, "").trim();
+  const out = [];
+  for (const admin of ADMINS_AVISO) {
+    try {
+      const r = await fetch("https://api.manychat.com/fb/subscriber/setCustomFieldByName", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.MANYCHAT_API_KEY}` },
+        body: JSON.stringify({ subscriber_id: admin, field_name: "aviso_admin", field_value: valor }),
+      });
+      const c = await r.json();
+      if (c.status !== "success") { console.error("Aviso admin (campo aviso_admin):", admin, JSON.stringify(c)); out.push(`❌ ${admin}: ${JSON.stringify(c)}`); continue; }
+      const s = await manychat("sendFlow", { subscriber_id: admin, flow_ns: process.env.MANYCHAT_FLOW_AVISO });
+      if (s.status !== "success") { console.error("Aviso admin (envio):", admin, JSON.stringify(s)); out.push(`❌ ${admin}: ${JSON.stringify(s)}`); continue; }
+      avisosEnviados.set(String(admin), Date.now());
+      console.log("Aviso por WhatsApp enviado al administrador", admin);
+      out.push(`✅ ${admin}`);
+    } catch (e) { console.error("Aviso admin:", admin, e.message); out.push(`❌ ${admin}: ${e.message}`); }
+  }
+  return out;
+}
+
 // 1) Liberar reservas pendientes sin pago despues de HORAS_PENDIENTE (48 h por defecto)
 async function liberarPendientes() {
   const horas = Number(process.env.HORAS_PENDIENTE || 48);
@@ -599,6 +660,18 @@ app.post("/webhook", async (req, res) => {
   }
   if (!phoneNumber || !message) return res.status(400).json({ error: "phoneNumber y message requeridos" });
 
+  // ACTIVAR AVISOS: le da a esa persona su codigo para recibir los avisos por WhatsApp (se pega en AVISO_ADMINS)
+  if (/^\W*activar\s+avisos\W*$/i.test(String(message))) {
+    const ya = ADMINS_AVISO.includes(String(phoneNumber));
+    console.log("ACTIVAR AVISOS desde", phoneNumber, ya ? "(ya registrado)" : "");
+    return res.json({ response: ya ? "✅ Este número ya recibe los avisos de Villa de Canto." : `🔔 Tu código para recibir avisos es: ${phoneNumber}\n\nCompártelo con quien configura el agente para que lo agregue.`, avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+  }
+  // Si un administrador contesta el aviso con "ok", "voy", "gracias" o un emoji, el agente no le responde
+  const tAviso = avisosEnviados.get(String(phoneNumber));
+  if (tAviso && Date.now() - tAviso < 3600000 && (/^\W*(ok|okay|oki|va|vale|voy|enterado|entendido|gracias|listo|perfecto|sale|de acuerdo|si|sí)\W*$/i.test(String(message).trim()) || /^[\p{Extended_Pictographic}\s\u200d\ufe0f]+$/u.test(String(message)))) {
+    return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+  }
+
   // Espera ESPERA_MS por si el cliente manda varios mensajes seguidos; solo el ultimo contesta con todo junto
   if (String(message).startsWith("[SISTEMA]") || esReanudar(message) || esReiniciar(message) || esContinuar(message)) return procesarMensaje(phoneNumber, telefono, message, res);
   const p = pendientes.get(phoneNumber) || { textos: [] };
@@ -746,6 +819,22 @@ function procesarMensaje(phoneNumber, telefono, message, res) {
   });
 }
 
+// Pide hablar con una persona: se detecta ANTES de llamar a Claude para pausar al instante
+const MSG_HUMANO_ES = process.env.MENSAJE_HUMANO || "Con gusto 🌿 En breve un administrador de la villa se contactará contigo. ¡Gracias!";
+const MSG_HUMANO_EN = "Of course 🌿 An administrator from the villa will contact you shortly. Thank you!";
+const LETRAS = "[a-záéíóúñü]*";
+const QUIEN = "(persona real|una persona|alguna persona|un ser humano|un humano|una humana|humano|(el |la |al |a la |un |una |su |tu )?(due[nñ][oa]|administrador[a]?|admin|encargad[oa]|asesor[a]?|gerente|agente|responsable|propietari[oa]|anfitri[oó]n|anfitriona))";
+const RE_PIDE_ES = [
+  new RegExp(`(habl|platic|comunic|comun[ií]c|comun[ií]qu|contact|cont[aá]ct|atend|ati[eé]nd|transfer|transfi[eé]r|conect|con[eé]ct|llam|ll[aá]m|pasar|p[aá]s(ame|eme|enme|anme|as|an|a)\\b)${LETRAS}[^.?!\\n]{0,30}\\b${QUIEN}(?![a-záéíóúñ])`, "i"),
+  new RegExp(`(habl|platic|comunic|comun[ií]c|contact|cont[aá]ct|conect|con[eé]ct)${LETRAS}[^.?!\\n]{0,15}\\bcon alguien\\b`, "i"),
+  /\b(me|nos) (llame|llamen|contacte|contacten|atienda|atiendan|escriba|escriban) (alguien|una persona|el administrador|el due[nñ]o)/i,
+  /\balguien (que )?(me|nos) (pueda |puede )?(atienda|atender|llame|llamar|contacte|contactar|escriba|escribir)\b/i,
+  /\b(quiero|necesito|prefiero)( a| hablar con)? (una persona|un humano|alguien real|una persona real)\b/i,
+  /\bno eres (una )?persona\b|\beres (un )?(bot|robot)\b/i,
+];
+const RE_PIDE_EN = /\b(talk|speak|chat|connect|transfer|call)\b[^.?!\n]{0,25}\b(human|real person|a person|someone|somebody|agent|manager|owner|host|admin|representative|staff)\b|\b(live agent|human agent|real person)\b|\bare you a (bot|robot)\b/i;
+const pideHablarConPersona = t => { const s = String(t || ""); return !s.startsWith("[SISTEMA]") && (RE_PIDE_ES.some(r => r.test(s)) || RE_PIDE_EN.test(s)); };
+
 function procesarConClaude(phoneNumber, telefono, message, res) {
   db.get("SELECT messages FROM conversations WHERE id = ?", [phoneNumber], async (err, row) => {
     let history = row ? JSON.parse(row.messages) : [];
@@ -759,6 +848,22 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         } catch (e) {
           console.error("Error confirmando reserva en Calendar:", e.message);
         }
+      }
+      // Pidio hablar con una persona: mensaje fijo, pausa inmediata y aviso a los administradores (sin llamar a Claude)
+      if (pideHablarConPersona(message)) {
+        const s = String(message), enIngles = RE_PIDE_EN.test(s) && !RE_PIDE_ES.some(r => r.test(s));
+        const texto = enIngles ? MSG_HUMANO_EN : MSG_HUMANO_ES;
+        const horas = Number(process.env.HORAS_PAUSA || 12);
+        db.run("INSERT OR REPLACE INTO pausas (id, hasta) VALUES (?, ?)", [phoneNumber, Date.now() + horas * 3600000]);
+        console.log("PIDE HABLAR CON PERSONA:", phoneNumber, "- agente en pausa", horas, "h");
+        history.push({ role: "assistant", content: texto });
+        if (history.length > 40) history.splice(0, history.length - 40);
+        while (history.length && history[0].role !== "user") history.shift();
+        db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))", [phoneNumber, JSON.stringify(history)]);
+        res.json({ response: texto, avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "si" });
+        bitacora("Pide hablar con persona", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber }).catch(() => {});
+        avisarAdmins({ id: phoneNumber, telefono, texto: message }).catch(e => console.error("Aviso admin:", e.message));
+        return;
       }
       let enviado = false;
       const timer = setTimeout(() => {
@@ -817,11 +922,7 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         mensajeCliente = mensajeCliente.replace(/ENVIAR_FOTOS/g, "").trim();
         console.log("FOTOS solicitadas por", phoneNumber);
       }
-      const pidePersona = /(hablar|comunicar|contactar|atender|pasar)[^.?!]{0,30}(persona|humano|alguien|due[nñ]o|administrador|encargad|asesor|gerente)|quiero (una )?persona|no eres (una )?persona|eres (un )?(bot|robot)/i.test(String(message));
-      if (pidePersona && !mensajeCliente.includes("PASAR_A_HUMANO")) {
-        mensajeCliente = "Con gusto 🌿 Le aviso al administrador de la villa para que te escriba en breve y te atienda personalmente.";
-        mensajeCliente += "\nPASAR_A_HUMANO";
-      }
+      const pidePersona = false; // si pidio hablar con una persona, ya se pauso antes de llamar a Claude
       // Grupo mayor a la capacidad: se detecta en el codigo para no depender de la IA
       const txt = String(message).toLowerCase();
       const maxNum = re => Math.max(0, ...[...txt.matchAll(re)].map(m => +m[1]));
@@ -887,6 +988,7 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         db.run("INSERT OR REPLACE INTO pausas (id, hasta) VALUES (?, ?)", [phoneNumber, Date.now() + horas * 3600000]);
         console.log("PASAR A HUMANO:", phoneNumber, "- agente en pausa", horas, "h");
         await bitacora("Pide hablar con persona", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber });
+        avisarAdmins({ id: phoneNumber, telefono, texto: message }).catch(e => console.error("Aviso admin:", e.message));
       }
       let fotosPinatas = "no";
       if (mensajeCliente.includes("FOTOS_PINATAS")) {
@@ -943,6 +1045,25 @@ app.get("/probar-recordatorio/:id", async (req, res) => {
     const out = await recordarCotizacion(q, true);
     res.send((out.startsWith("enviado") ? "✅ Recordatorio enviado. Revisa tu WhatsApp.\n\n" : "❌ ") + out);
   } catch (err) { res.send("❌ Error: " + err.message); }
+});
+
+// Lista los grupos de WhatsApp del numero conectado a Whapi para copiar el ID: abrir /grupos-whatsapp
+app.get("/grupos-whatsapp", async (req, res) => {
+  if (!process.env.WHAPI_TOKEN) return res.type("text/plain").send("❌ Falta WHAPI_TOKEN en Railway");
+  try {
+    const r = await fetch("https://gate.whapi.cloud/groups?count=100", { headers: { Authorization: `Bearer ${process.env.WHAPI_TOKEN.trim()}` } });
+    const c = await r.json().catch(() => ({}));
+    const gs = c.groups || [];
+    res.type("text/plain").send(gs.length
+      ? "Copia el ID de tu grupo y pégalo en Railway como WHAPI_GRUPO:\n\n" + gs.map(g => `${g.name || g.subject || "(sin nombre)"}\n   ${g.id}`).join("\n\n")
+      : `No encontré grupos (${r.status}). Revisa que el número conectado a Whapi esté dentro del grupo.\n${JSON.stringify(c).slice(0, 300)}`);
+  } catch (e) { res.type("text/plain").send("❌ " + e.message); }
+});
+
+// Prueba del aviso por WhatsApp a los administradores: abrir /probar-aviso en el navegador
+app.get("/probar-aviso", async (req, res) => {
+  const out = await avisarAdmins({ nombre: "Huésped de prueba", telefono: "4421234567", texto: "quiero hablar con el administrador" });
+  res.type("text/plain").send(out.join("\n") + (out.some(x => x.startsWith("✅")) ? "\n\nRevisa el grupo de WhatsApp." : ""));
 });
 
 const server = app.listen(PORT, () => console.log(`Agente Vero en puerto ${PORT}`));
