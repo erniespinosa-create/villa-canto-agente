@@ -476,6 +476,8 @@ PRESENTACION: en tu PRIMER mensaje de cada conversacion (cuando aun no has escri
 
 FECHA DE HOY: ${hoyMexico()} (usa esto para resolver "manana", "el viernes", "este fin de semana", etc. sin preguntar)
 
+VARIOS MENSAJES: el cliente suele escribir en varios mensajes seguidos y te llegan juntos, uno por renglon (ej. "Hola" y luego "Me cotizas para el sabado?"). Contesta TODO en UNA sola respuesta: saluda una sola vez y responde directo a lo que pide; nunca contestes cada renglon por separado.
+
 FORMATO DE FECHAS: El cliente puede escribir fechas de cualquier forma (22/09/2026, 22-09-2026, "22 de septiembre", "manana", "el viernes que entra"). Acepta y entiende cualquier formato, nunca rechaces una fecha por su formato.
 
 NUNCA INVENTES DATOS: usa solo lo que el cliente escribio literalmente. Si dice "2 adultos" y no menciona ninos, pregunta "¿van ninos?" o asume 0; jamas agregues personas, fechas o motivos que no dijo.
@@ -677,10 +679,20 @@ app.post("/webhook", async (req, res) => {
   const p = pendientes.get(phoneNumber) || { textos: [] };
   if (p.timer) { clearTimeout(p.timer); p.res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" }); }
   if (!p.textos.includes(String(message))) p.textos.push(String(message));
+  // Si Vero esta contestando un mensaje anterior, esa respuesta se descarta y se contesta todo junto
+  if (pensando.has(phoneNumber)) cancelados.add(phoneNumber);
   p.res = res;
+  // Solo saludo ("hola", "buenas tardes"): casi siempre sigue otro mensaje. Se suelta a ManyChat y se espera mas
+  let espera = ESPERA_MS;
+  if (p.textos.length === 1 && esSaludo(message)) {
+    res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+    p.res = resPorApi(phoneNumber);
+    espera = ESPERA_SALUDO_MS;
+    console.log("Solo saludo de", phoneNumber, "- espero", espera / 1000, "s por si escribe algo mas");
+  }
   const lanzar = () => {
     // Si todavia esta contestando un mensaje anterior, espera a que termine y junta todo
-    if (procesando.has(phoneNumber)) { p.timer = setTimeout(lanzar, 700); return; }
+    if (procesando.has(phoneNumber) || pensando.has(phoneNumber)) { p.timer = setTimeout(lanzar, 700); return; }
     pendientes.delete(phoneNumber);
     procesando.add(phoneNumber);
     console.log("Procesando", p.textos.length, "mensaje(s) de", phoneNumber);
@@ -688,11 +700,17 @@ app.post("/webhook", async (req, res) => {
       .catch(e => console.error("Error procesando:", e.message))
       .finally(() => procesando.delete(phoneNumber));
   };
-  p.timer = setTimeout(lanzar, ESPERA_MS);
+  p.timer = setTimeout(lanzar, espera);
   pendientes.set(phoneNumber, p);
 });
 
 const ESPERA_MS = Number(process.env.ESPERA_MS || 3000);
+const ESPERA_SALUDO_MS = Number(process.env.ESPERA_SALUDO_MS || 25000);
+const cancelados = new Set();
+const pensando = new Set(); // mientras Claude prepara la respuesta de ese contacto
+const esSaludo = m => /^[\s\W]*((hola|holi|holaa+|buen[oa]s?|d[ií]as|tardes|noches|qu[eé] tal|que onda|info|informaci[oó]n|hey|hi|hello|saludos)[\s\W]*)+$/i.test(String(m).trim());
+// Respuesta "falsa" para cuando ManyChat ya se solto: lo que se conteste se manda por la API de ManyChat
+const resPorApi = id => ({ t0: Date.now() + 1e9, headersSent: false, status() { return this; }, json(o) { if (o && o.response && o.omitir !== "si") enviarPorManyChat(id, o.response); } });
 // ManyChat corta la espera a los ~10 s. Si Claude tarda mas (revisando calendario), se contesta un "un momento"
 // y la respuesta final se manda despues por la API de ManyChat (requiere MANYCHAT_API_KEY).
 const LIMITE_MS = Number(process.env.LIMITE_MS || 8500); // tiempo total desde que llega el mensaje
@@ -870,11 +888,23 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         enviado = true;
         console.log("Respuesta lenta, se enviara completa por API a", phoneNumber);
         // Sin mensaje intermedio: ManyChat recibe vacio (la condicion res_respuesta no esta vacio lo ignora) y la respuesta completa llega por API
-        res.json({ response: process.env.MENSAJE_ESPERA || "🌿", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+        res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
       }, Math.max(300, LIMITE_MS - (Date.now() - (res.t0 || Date.now()))));
       let reply;
+      pensando.add(phoneNumber);
       try { reply = await responderConClaude(history, phoneNumber); }
-      catch (e) { clearTimeout(timer); if (enviado) { console.error(e); return enviarPorManyChat(phoneNumber, "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?"); } throw e; }
+      catch (e) { pensando.delete(phoneNumber); clearTimeout(timer); if (enviado) { console.error(e); return enviarPorManyChat(phoneNumber, "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?"); } throw e; }
+      pensando.delete(phoneNumber);
+      // Llego otro mensaje mientras pensaba: no se manda esta respuesta, se junta con lo nuevo y se contesta una sola vez
+      if (cancelados.has(phoneNumber) && pendientes.has(phoneNumber) && !/RESERVA_JSON|AVISO_PAGO|PASAR_A_HUMANO/.test(String(reply))) {
+        cancelados.delete(phoneNumber);
+        clearTimeout(timer);
+        pendientes.get(phoneNumber).textos.unshift(String(message));
+        console.log("Respuesta descartada (llego otro mensaje), se contesta todo junto a", phoneNumber);
+        if (!enviado) res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+        return;
+      }
+      cancelados.delete(phoneNumber);
       let mensajeCliente = reply;
       const match = reply.match(/RESERVA_JSON:(\{.*\})/);
       if (match) {
