@@ -1,0 +1,17 @@
+{
+  "name": "villa-de-canto-agente",
+  "version": "1.0.0",
+  "description": "Agente Claude para reservas de Villa de Canto",
+  "main": "villa-de-canto-agente.js",
+  "scripts": {
+    "start": "node villa-de-canto-agente.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.28.0",
+    "@resvg/resvg-js": "^2.6.2",
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "googleapis": "^118.0.0",
+    "sqlite3": "^5.1.6"
+  }
+}
