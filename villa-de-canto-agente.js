@@ -250,8 +250,9 @@ async function avisarAdmins({ id, telefono, texto, nombre }) {
     } catch (e) { console.error("Aviso al grupo:", e.message); return [`❌ Grupo: ${e.message}`]; }
   }
   if (!process.env.MANYCHAT_API_KEY || !process.env.MANYCHAT_FLOW_AVISO || !ADMINS_AVISO.length) {
-    console.log("Aviso sin configurar: faltan WHAPI_TOKEN y WHAPI_GRUPO en Railway");
-    return ["❌ Faltan WHAPI_TOKEN y WHAPI_GRUPO en Railway"];
+    const faltan = [!process.env.MANYCHAT_API_KEY && "MANYCHAT_API_KEY", !process.env.MANYCHAT_FLOW_AVISO && "MANYCHAT_FLOW_AVISO", !ADMINS_AVISO.length && "AVISO_ADMINS"].filter(Boolean).join(", ");
+    console.error("AVISO NO ENVIADO: faltan en Railway", faltan);
+    return [`❌ Faltan en Railway: ${faltan}`];
   }
   const valor = `${nombre}${tel} escribió: ${dijo || "quiere hablar con el administrador"}`.replace(/\s+/g, " ").replace(/[.\s]+$/, "").trim();
   const out = [];
@@ -264,7 +265,13 @@ async function avisarAdmins({ id, telefono, texto, nombre }) {
       });
       const c = await r.json();
       if (c.status !== "success") { console.error("Aviso admin (campo aviso_admin):", admin, JSON.stringify(c)); out.push(`❌ ${admin}: ${JSON.stringify(c)}`); continue; }
-      const s = await manychat("sendFlow", { subscriber_id: admin, flow_ns: process.env.MANYCHAT_FLOW_AVISO });
+      // Hasta 3 intentos: ManyChat a veces falla un momento y el aviso se perdia
+      let s = {};
+      for (let i = 0; i < 3; i++) {
+        try { s = await manychat("sendFlow", { subscriber_id: admin, flow_ns: process.env.MANYCHAT_FLOW_AVISO }); } catch (e) { s = { status: "error", message: e.message }; }
+        if (s.status === "success") break;
+        await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+      }
       if (s.status !== "success") { console.error("Aviso admin (envio):", admin, JSON.stringify(s)); out.push(`❌ ${admin}: ${JSON.stringify(s)}`); continue; }
       avisosEnviados.set(String(admin), Date.now());
       console.log("Aviso por WhatsApp enviado al administrador", admin);
@@ -485,7 +492,7 @@ NUNCA INVENTES DATOS: usa solo lo que el cliente escribio literalmente. Si dice 
 DISPONIBILIDAD: en cuanto tengas fecha de llegada y de salida, usa la herramienta consultar_disponibilidad ANTES de cotizar. Si no esta disponible, dilo con calidez y ofrece buscar otras fechas. Nunca digas que hay disponibilidad sin haberla consultado.
 
 DATOS:
-- Capacidad y personas adicionales: se cuentan TODAS las personas (adultos + ninos). Hasta 15 personas en total: tarifa normal. De 16 a 20 personas en total: se cobran $750 MXN por cada persona adicional (las que pasen de 15) POR NOCHE. Ponlo en la cotizacion como linea aparte (ej. 18 personas por 2 noches: 3 personas adicionales x $750 x 2 noches = $4,500) y SUMALO al total de la renta (asi el anticipo del 50% tambien lo incluye) y al campo total del RESERVA_JSON. 20 personas es el maximo que puedes cotizar y apartar. Si son 21 PERSONAS O MAS en total, NO cotices ni apartes: dile con calidez que para grupos de mas de 20 personas el administrador de la villa le dara una atencion personalizada. PRIMERO, si ya te dio fechas, usa consultar_disponibilidad (si estan OCUPADAS dile con calidez que no hay disponibilidad y ofrece otras fechas, sin PASAR_A_HUMANO). Solo con fechas LIBRES preguntale con calidez cual es el plan o que tiene en mente (tipo de evento o celebracion, fechas y numero total de personas) y agrega al FINAL, en su propia linea, PASAR_A_HUMANO (el sistema esperara su respuesta antes de avisar al administrador).
+- Capacidad y personas adicionales: se cuentan TODAS las personas (adultos + ninos). Hasta 15 personas en total: tarifa normal. De 16 a 20 personas en total: se cobran $750 MXN por cada persona adicional (las que pasen de 15) POR NOCHE. Ponlo en la cotizacion como linea aparte (ej. 18 personas por 2 noches: 3 personas adicionales x $750 x 2 noches = $4,500) y SUMALO al total de la renta (asi el anticipo del 50% tambien lo incluye) y al campo total del RESERVA_JSON. 20 personas es el maximo que puedes cotizar y apartar. Si son 21 PERSONAS O MAS en total, O si es una FIESTA o EVENTO con mas de 20 asistentes (aunque solo 15 a 20 se vayan a hospedar), NO cotices ni apartes. PRIMERO, si ya te dio fechas, usa consultar_disponibilidad (si estan OCUPADAS dile con calidez que no hay disponibilidad y ofrece otras fechas, sin PASAR_A_HUMANO). Si las fechas estan libres o aun no las da: dile con calidez que para fiestas y grupos grandes el administrador de la villa le dara una atencion personalizada y que en breve le escribe por este chat, y agrega al FINAL, en su propia linea, PASAR_A_HUMANO (se avisa al administrador de inmediato).
 - Direccion: Boulevard Rodolfo Gaona 106, Campestre Amazcala
 - Check-in 13:00 | Check-out 12:00
 - Ubicacion en Google Maps: https://www.google.com/maps?q=20.6901757,-100.2620513
@@ -674,6 +681,14 @@ app.post("/webhook", async (req, res) => {
     return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
   }
 
+  // PAUSA AUTOMATICA: cuando el administrador escribe a mano (WhatsApp o chat en vivo), ManyChat vuelve a mandar
+  // el ultimo mensaje del cliente. Si llega repetido y Vero ya lo habia contestado, es el administrador: Vero se pausa.
+  const msgN = String(message).trim(), ult = ultimoCliente.get(String(phoneNumber));
+  if (ult && ult.texto === msgN && !msgN.startsWith("[") && Date.now() - ult.t > ECO_MIN_MS && Date.now() - ult.t < 48 * 3600000 && !pendientes.has(phoneNumber) && !procesando.has(phoneNumber)) {
+    pausarPorAdmin(phoneNumber, "el administrador escribio al cliente");
+    return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
+  }
+
   // Espera ESPERA_MS por si el cliente manda varios mensajes seguidos; solo el ultimo contesta con todo junto
   if (String(message).startsWith("[SISTEMA]") || esReanudar(message) || esReiniciar(message) || esContinuar(message)) return procesarMensaje(phoneNumber, telefono, message, res);
   const p = pendientes.get(phoneNumber) || { textos: [] };
@@ -698,7 +713,7 @@ app.post("/webhook", async (req, res) => {
     console.log("Procesando", p.textos.length, "mensaje(s) de", phoneNumber);
     Promise.resolve(procesarMensaje(phoneNumber, telefono, p.textos.join("\n"), p.res))
       .catch(e => console.error("Error procesando:", e.message))
-      .finally(() => procesando.delete(phoneNumber));
+      .finally(() => { procesando.delete(phoneNumber); ultimoCliente.set(String(phoneNumber), { texto: String(p.textos[p.textos.length - 1]).trim(), t: Date.now() }); });
   };
   p.timer = setTimeout(lanzar, espera);
   pendientes.set(phoneNumber, p);
@@ -707,6 +722,15 @@ app.post("/webhook", async (req, res) => {
 const ESPERA_MS = Number(process.env.ESPERA_MS || 3000);
 const ESPERA_SALUDO_MS = Number(process.env.ESPERA_SALUDO_MS || 25000);
 const cancelados = new Set();
+const ultimoCliente = new Map(); // contacto -> ultimo mensaje del cliente ya contestado (para detectar al administrador)
+const ECO_MIN_MS = Number(process.env.ECO_MIN_MS || 5000);
+function pausarPorAdmin(id, motivo) {
+  const horas = Number(process.env.HORAS_PAUSA || 12);
+  db.run("INSERT OR REPLACE INTO pausas (id, hasta) VALUES (?, ?)", [String(id), Date.now() + horas * 3600000]);
+  const p = pendientes.get(id); if (p && p.timer) clearTimeout(p.timer);
+  pendientes.delete(id); planGrupo.delete(id); grupoGrande.delete(id); ultimoCliente.delete(String(id));
+  console.log("PAUSA AUTOMATICA:", motivo, "-", id, "- Vero en pausa", horas, "h");
+}
 const pensando = new Set(); // mientras Claude prepara la respuesta de ese contacto
 const esSaludo = m => /^[\s\W]*((hola|holi|holaa+|buen[oa]s?|d[ií]as|tardes|noches|qu[eé] tal|que onda|info|informaci[oó]n|hey|hi|hello|saludos)[\s\W]*)+$/i.test(String(m).trim());
 // Respuesta "falsa" para cuando ManyChat ya se solto: lo que se conteste se manda por la API de ManyChat
@@ -746,6 +770,13 @@ function reiniciarContacto(id) {
 app.get("/reiniciar/:id", (req, res) => {
   reiniciarContacto(req.params.id);
   res.send("✅ Conversación reiniciada para " + req.params.id + ". El agente empieza de cero con ese contacto.");
+});
+
+// PAUSAR: el administrador toma el chat (etiqueta pausar-vero en ManyChat -> Solicitud externa GET /pausar/ID)
+app.get("/pausar/:id", (req, res) => {
+  const horas = Number(process.env.HORAS_PAUSA || 12);
+  pausarPorAdmin(req.params.id, "pausa manual");
+  res.send(`⏸️ Vero en pausa ${horas} h con ${req.params.id}. Para reactivarla: ${URL_PUBLICA}/continuar/${req.params.id}`);
 });
 
 // Reanudar desde el navegador: https://TU-APP.up.railway.app/reanudar/ID_DEL_CONTACTO
@@ -957,7 +988,7 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
       const txt = String(message).toLowerCase();
       const maxNum = re => Math.max(0, ...[...txt.matchAll(re)].map(m => +m[1]));
       const nAdultos = maxNum(/(\d{1,3})\s*adultos?/g);
-      const nPersonas = maxNum(/(\d{1,3})\s*(personas?|pax|invitados?|huespedes?|huéspedes?|gente)/g);
+      const nPersonas = maxNum(/(\d{1,3})\s*(personas?|pax|invitados?|huespedes?|huéspedes?|gente|asistentes?|amigos?|familiares)/g);
       const nNinos = maxNum(/(\d{1,3})\s*(niñ[oa]s?|nin[oa]s?|menores?)/g);
       const totalPersonas = Math.max(nPersonas, nAdultos + nNinos); // adultos + ninos
       const esGrupo = totalPersonas > 20; // 16-20 se cotiza con $750 por persona adicional; 21+ al administrador
@@ -979,8 +1010,8 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         }
         if (esGrupo) grupoGrande.set(phoneNumber, Date.now());
         if (!f) {
-          if (esGrupo && !/fecha|cu[aá]ndo|qu[eé] d[ií]a/i.test(mensajeCliente)) mensajeCliente += "\n\n¿Para qué fechas lo tienen pensado (llegada y salida)? Así reviso la disponibilidad 🗓️";
-          console.log("GRUPO GRANDE: sin fechas todavia", phoneNumber);
+          planGrupo.set(phoneNumber, Date.now()); // sin fechas: se avisa de inmediato al administrador
+          console.log("GRUPO GRANDE: sin fechas, se pasa al administrador", phoneNumber);
         } else {
           let disp = { disponible: true };
           try { disp = await consultarDisponibilidad(f.llegada, f.salida); } catch (e) { console.error("Disponibilidad grupo:", e.message); }
@@ -1010,6 +1041,17 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         mensajeCliente = "¡Qué gusto que quieran venir en grupo! 🌿 Para grupos de más de 20 personas, el administrador de la villa te dará una atención personalizada. Para pasarle toda la información, ¿me cuentas cuál es el plan o qué tienen en mente? (tipo de evento o celebración, fechas y cuántas personas serían en total) 😊";
         planGrupo.set(phoneNumber, Date.now());
       }
+      // Fiesta o grupo grande: aviso INMEDIATO al administrador y pausa (ya no se espera a que el cliente cuente el plan)
+      let motivoAviso = message;
+      const grupoAhora = planGrupo.get(phoneNumber);
+      if (grupoAhora && grupoAhora !== espera) {
+        planGrupo.delete(phoneNumber); grupoGrande.delete(phoneNumber);
+        mensajeCliente = "¡Qué gusto que nos consideren para su celebración! 🎉 Para fiestas y grupos grandes, el administrador de la villa te dará una atención personalizada. Ya le avisé y en breve te escribe por aquí 😊\nPASAR_A_HUMANO";
+        reply = mensajeCliente;
+      }
+      if (/PASAR_A_HUMANO/.test(mensajeCliente) && (totalPersonas > 20 || espera || grupoAhora)) {
+        motivoAviso = `🎉 FIESTA / GRUPO GRANDE${totalPersonas ? ` (${totalPersonas} personas)` : ""}: ${message}`;
+      }
       let avisoHumano = "no";
       if (mensajeCliente.includes("PASAR_A_HUMANO")) {
         avisoHumano = "si";
@@ -1017,8 +1059,8 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         const horas = Number(process.env.HORAS_PAUSA || 12);
         db.run("INSERT OR REPLACE INTO pausas (id, hasta) VALUES (?, ?)", [phoneNumber, Date.now() + horas * 3600000]);
         console.log("PASAR A HUMANO:", phoneNumber, "- agente en pausa", horas, "h");
-        await bitacora("Pide hablar con persona", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber });
-        avisarAdmins({ id: phoneNumber, telefono, texto: message }).catch(e => console.error("Aviso admin:", e.message));
+        await bitacora("Pide hablar con persona", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber }).catch(() => {});
+        avisarAdmins({ id: phoneNumber, telefono, texto: motivoAviso }).then(out => console.log("Resultado aviso:", out.join(" | "))).catch(e => console.error("Aviso admin:", e.message));
       }
       let fotosPinatas = "no";
       if (mensajeCliente.includes("FOTOS_PINATAS")) {
