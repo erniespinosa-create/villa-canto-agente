@@ -103,10 +103,23 @@ async function consultarUnaVez(llegada, salida) {
     singleEvents: true,
   });
   const todos = (r.data.items || []).filter(e => e.status !== "cancelled");
-  const ocupados = todos.filter(esReserva);
+  // Mismo criterio que la imagen del calendario: el evento debe pisar alguna noche real (13:00 llegada - 12:00 salida)
+  const ocupados = todos.filter(esReserva).filter(e => solapaEstancia(e, aISO(llegada), aISO(salida)));
   if (todos.length !== ocupados.length) console.log("Eventos ignorados (no son color de reserva):", todos.filter(e => !esReserva(e)).map(e => e.summary + " [color " + (e.colorId || "default") + "]").join(" | "));
   return { disponible: ocupados.length === 0, eventos: ocupados };
 }
+
+// Rango real de un evento. Los de "todo el dia" (Airbnb, bloqueos a mano) se leen como llegada 13:00 -> salida 12:00,
+// asi un evento del 14 al 16 ocupa las noches 14 y 15, y no bloquea por error la noche del 13.
+function rangoEvento(e) {
+  if (e.start.date) return [Date.parse(`${e.start.date}T13:00:00-06:00`), Date.parse(`${e.end.date}T12:00:00-06:00`)];
+  return [Date.parse(e.start.dateTime), Date.parse(e.end.dateTime)];
+}
+function solapaEstancia(e, llegadaISO, salidaISO) {
+  const [s, f] = rangoEvento(e);
+  return s < Date.parse(`${salidaISO}T12:00:00-06:00`) && f > Date.parse(`${llegadaISO}T13:00:00-06:00`);
+}
+const sigDia = iso => new Date(Date.parse(iso + "T12:00:00Z") + 86400000).toISOString().slice(0, 10);
 
 // Doble verificacion: consulta el calendario 2 veces (con 1.5 s de pausa); si alguna dice ocupado, esta ocupado
 async function consultarDisponibilidad(llegada, salida) {
@@ -122,6 +135,7 @@ async function crearEventoCalendar(datos) {
   if (Number(datos.adultos || 0) + Number(datos.ninos || 0) > 20) return { excedido: true };
   const { disponible } = await consultarDisponibilidad(datos.llegada, datos.salida);
   if (!disponible) return { ocupado: true };
+  cacheCal.clear(); // la imagen del calendario se regenera con la nueva reserva
   const evento = await calendar.events.insert({
     calendarId: CALENDAR_ID,
     resource: {
@@ -536,7 +550,17 @@ PAGO:
 - IMPORTANTE: la cuenta de Inbursa YA NO SE USA. Si en la conversacion aparecen datos de Inbursa, aclara con amabilidad que la cuenta cambio y da los datos de BBVA
 - Si el cliente comenta que la cuenta aparece a nombre de Emilio Diaz (o pregunta a nombre de quien esta), confirmale con calidez que es correcto, que es la cuenta de Villa de Canto y puede continuar con su transferencia con toda confianza. No menciones ese nombre si el cliente no lo pregunta
 - DEPOSITO EN GARANTIA: $5,000 MXN, APARTE de la renta, reembolsable dentro de las 48 h siguientes al check-out si no hay danos ni cargos pendientes. SIEMPRE incluyelo:
-  1) En la cotizacion, como linea aparte despues del total y del anticipo (ej. "Deposito en garantia: $5,000 (reembolsable 48 h despues de tu salida)").
+  1) En la cotizacion, despues del total, pon el bloque "PARA APARTAR TUS FECHAS" con el desglose: Anticipo 50% $X, + Deposito en garantia $5,000 (reembolsable 48 h despues de tu salida), = Total para apartar $X+5,000. Luego "Restante el dia de llegada: $Y" (el otro 50%). Usa este formato exacto, un concepto por renglon:
+     🗓️ Viernes 14 al domingo 16 de noviembre (2 noches)
+     👥 12 personas
+     • Viernes 14: $12,000
+     • Sábado 15: $14,000
+     Total de la renta: $26,000
+     PARA APARTAR TUS FECHAS
+     Anticipo 50%: $13,000
+     + Depósito en garantía: $5,000 (reembolsable 48 h después de tu salida)
+     = Total para apartar: $18,000
+     Restante el día de llegada: $13,000
   2) Al mandar los datos bancarios, pide transferir el anticipo MAS el deposito y escribe el monto exacto a transferir (ej. "Anticipo $12,000 + Deposito en garantia $5,000 = Total a transferir: $17,000").
   Nunca lo sumes al total de la renta ni lo cuentes dentro del 50%. Si preguntan para que es: cubre danos, faltantes o limpieza extraordinaria, y se devuelve completo si todo esta en orden.
 
@@ -582,6 +606,16 @@ FOTOS: ENVIAR_FOTOS es SOLO para fotos de la casa. Si piden fotos de pinatas, in
 CONTRATO E INE: NO hables del contrato ni pidas INE durante la cotizacion ni al apartar, y NUNCA mandes link de contrato. El contrato lo llena el administrador de la villa junto con el huesped a su llegada, en formato digital (toma 2 minutos) y se requiere la INE. Mencionalo solo al confirmar el pago ([SISTEMA] PAGO_CONFIRMADO). Si antes preguntan por el contrato, explica exactamente eso.
 
 PASAR A UNA PERSONA: si el cliente pide hablar con una persona, con el dueno o el administrador, si esta molesto o frustrado, si tiene una queja, o si pregunta algo que no puedes resolver con esta informacion, dile con calidez que lo comunicas con el administrador de la villa y que en breve le escribe, y agrega al FINAL de tu respuesta, en su propia linea: PASAR_A_HUMANO. No sigas cotizando en ese mensaje.
+
+QUE HAY CERCA (si preguntan por tiendas, OXXO, super, farmacia, que hacer o que hay cerca): contesta con calidez usando SOLO esta lista, un lugar por renglon con su distancia. Si un lugar no esta en la lista, NO lo inventes ni des distancias: di que el administrador le puede recomendar.
+${process.env.LUGARES_CERCA || `- Pueblo de Amazcala (a unos minutos en coche, junto a la Hacienda): tienditas de abarrotes y misceláneas, frutería y Farmacia San Isidro (Av. San Isidro)
+- OXXO La Griega: sobre la Carretera 500 (El Paraíso-Chichimequillas) km 7.5, colonia El Crucero, a unos 10-15 min en coche. Abre de 8:00 a 22:00 todos los días
+- La Griega (el pueblo más grande cercano, a unos 10-15 min): centro comercial, farmacias, gasolinera y restaurantes como El Rincón del Cabrito y la marisquería El Mar
+- Hacienda Amazcala (junto al fraccionamiento): vinícola histórica con restaurante, recorridos y experiencias en viñedo
+- Estamos en plena Ruta del Queso y Vino de Querétaro
+- Aeropuerto de Querétaro: unos 10-15 min | Centro de Querétaro: unos 30 min
+- Supermercado grande (Bodega Aurrerá, etc.): está hacia la zona de El Marqués / Hacienda La Cruz; sugiere que hagan el súper grande en Querétaro antes de llegar
+Las distancias son aproximadas; dilas como "unos X minutos".`}
 
 MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada (menciona en una frase que su deposito en garantia de $5,000 se le reembolsa dentro de las 48 h siguientes a su salida si todo esta en orden). Luego, en tono cercano (NO como lista de tareas ni "Para terminar"), dile que el administrador de la villa los recibira a su llegada y, para facilitarles todo, llenaran juntos el contrato digital en ese momento (toma solo 2 minutos); que por favor tengan a la mano su INE, ya que se requiere para el contrato. NO mandes ningun link de contrato y NO pidas la INE por este chat. Despues dale los datos de llegada: direccion, link de ubicacion en Google Maps (https://www.google.com/maps?q=20.6901757,-100.2620513), check-in 13:00, check-out 12:00, y el numero del administrador de la villa (442 874 2383): con el se verifica cualquier persona extra o cambio de horario de entrada o salida. Nunca menciones la palabra SISTEMA.`;
 }
@@ -1168,10 +1202,12 @@ async function diasOcupados(y, m) {
   const mm = String(m).padStart(2, "0"), sig = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, "0")}`;
   const r = await calendar.events.list({ calendarId: CALENDAR_ID, timeMin: `${y}-${mm}-01T00:00:00-06:00`, timeMax: `${sig}-01T00:00:00-06:00`, singleEvents: true, maxResults: 250 });
   const set = new Set();
-  for (const e of (r.data.items || []).filter(x => x.status !== "cancelled" && esReserva(x))) {
-    const s = String(e.start.date || e.start.dateTime).slice(0, 10), f = String(e.end.date || e.end.dateTime).slice(0, 10);
-    if (s === f) { set.add(s); continue; }
-    for (let d = new Date(s + "T12:00:00Z"); d.toISOString().slice(0, 10) < f; d = new Date(d.getTime() + 86400000)) set.add(d.toISOString().slice(0, 10));
+  const evs = (r.data.items || []).filter(x => x.status !== "cancelled" && esReserva(x));
+  // Cada noche se marca ocupada con la MISMA regla que usa Vero al cotizar (consultarUnaVez)
+  const dias = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  for (let d = 1; d <= dias; d++) {
+    const iso = `${y}-${mm}-${String(d).padStart(2, "0")}`;
+    if (evs.some(e => solapaEstancia(e, iso, sigDia(iso)))) set.add(iso);
   }
   return set;
 }
@@ -1241,7 +1277,7 @@ async function cargarFuentes() {
 const cacheCal = new Map();
 async function pngCalendario(mes) {
   const c = cacheCal.get(mes);
-  if (c && Date.now() - c.t < 5 * 60000) return c.png;
+  if (c && Date.now() - c.t < 60000) return c.png;
   const [y, m] = mes.split("-").map(Number);
   const { svg } = svgCalendario(y, m, await diasOcupados(y, m));
   const { Resvg } = require("@resvg/resvg-js");
@@ -1250,6 +1286,28 @@ async function pngCalendario(mes) {
   cacheCal.set(mes, { t: Date.now(), png });
   return png;
 }
+// Verificacion: compara noche por noche la imagen contra la consulta de disponibilidad que usa Vero al cotizar
+// https://TU-APP.up.railway.app/verificar-calendario/2026-11?clave=TU_CLAVE
+app.get("/verificar-calendario/:mes", async (req, res) => {
+  if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Clave incorrecta");
+  const mes = (String(req.params.mes).match(/^(\d{4})-(\d{2})/) || [])[0];
+  if (!mes) return res.status(400).send("Usa /verificar-calendario/AAAA-MM");
+  try {
+    const [y, m] = mes.split("-").map(Number), mm = String(m).padStart(2, "0");
+    const img = await diasOcupados(y, m);
+    const dias = new Date(Date.UTC(y, m, 0)).getUTCDate(), filas = [];
+    let errores = 0;
+    for (let d = 1; d <= dias; d++) {
+      const iso = `${y}-${mm}-${String(d).padStart(2, "0")}`;
+      const v = await consultarUnaVez(iso, sigDia(iso));
+      const enImg = img.has(iso), enVero = !v.disponible, ok = enImg === enVero;
+      if (!ok) errores++;
+      filas.push(`${ok ? "✅" : "❌"} ${iso.split("-").reverse().join("-")}  imagen: ${enImg ? "OCUPADO" : "libre"}  |  Vero: ${enVero ? "OCUPADO" : "libre"}${v.eventos.length ? "  ← " + v.eventos.map(e => e.summary).join(", ") : ""}`);
+    }
+    res.type("text/plain; charset=utf-8").send(`${errores ? "❌ " + errores + " noche(s) no coinciden" : "✅ La imagen coincide noche por noche con Google Calendar"}\n\n${filas.join("\n")}`);
+  } catch (e) { res.status(500).send("Error: " + e.message); }
+});
+
 app.get("/calendario/:mes", async (req, res) => {
   const mes = (String(req.params.mes).match(/^(\d{4})-(\d{2})/) || [])[0];
   if (!mes) return res.status(400).send("Usa /calendario/AAAA-MM.png");
