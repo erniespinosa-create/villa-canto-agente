@@ -323,7 +323,7 @@ async function liberarPendientes() {
 const MX = 6 * 3600000; // Ciudad de Mexico: UTC-6 todo el ano
 const dbGet = (sql, args) => new Promise(ok => db.get(sql, args, (e, r) => ok(e ? null : r)));
 function horaRecordatorio(creado) {
-  const ideal = creado + Number(process.env.HORAS_RECORDATORIO_COTIZACION || 12) * 3600000;
+  const ideal = creado + Number(process.env.HORAS_RECORDATORIO_COTIZACION || 3) * 3600000;
   const loc = new Date(ideal - MX), h = loc.getUTCHours() + loc.getUTCMinutes() / 60;
   if (h >= 9 && h < 21) return ideal;
   const manana = new Date(loc);
@@ -352,13 +352,29 @@ async function enviarRecordatorios() {
     try { const out = await recordarCotizacion(q); if (!String(out).startsWith("esperando")) console.log("Recordatorio de cotizacion", q.id, "->", String(out).slice(0, 120)); }
     catch (err) { console.error("Recordatorio de cotizacion:", err.message); }
   }
+  // Segundo toque: si no contesto al primer recordatorio, uno mas antes de que cierre la ventana de 24 h de WhatsApp
+  const h2 = Number(process.env.HORAS_SEGUNDO_RECORDATORIO || 20);
+  const segs = await new Promise(ok => db.all("SELECT * FROM cotizaciones WHERE recordatorio = 'enviado' AND enviado_en IS NOT NULL AND ultimo_cliente IS NOT NULL", [], (e, r2) => ok(e ? [] : r2 || [])));
+  for (const q of segs) {
+    const marcar = estado => db.run("UPDATE cotizaciones SET recordatorio = ? WHERE id = ?", [estado, q.id]);
+    if (await dbGet("SELECT id FROM no_recordar WHERE id = ?", [q.id])) { marcar("no"); continue; }
+    const pausa = await dbGet("SELECT hasta FROM pausas WHERE id = ?", [q.id]);
+    if (pausa && pausa.hasta > ahora) continue;
+    const conv = await dbGet("SELECT updated_at FROM conversations WHERE id = ?", [q.id]);
+    const act = conv ? new Date(String(conv.updated_at).replace(" ", "T") + "Z").getTime() : 0;
+    if (act > q.enviado_en + 30000) { marcar("respondio"); continue; }
+    if (ahora > q.ultimo_cliente + 23 * 3600000) { marcar("fin"); continue; }
+    if (ahora < Math.max(q.ultimo_cliente + h2 * 3600000, q.enviado_en + 3 * 3600000)) continue;
+    try { const out = await recordarCotizacion(q, false, true); console.log("Segundo recordatorio", q.id, "->", String(out).slice(0, 120)); }
+    catch (err) { console.error("Segundo recordatorio:", err.message); }
+  }
 }
-async function recordarCotizacion(q, forzar) {
+async function recordarCotizacion(q, forzar, segundo) {
   const conv = await dbGet("SELECT messages, updated_at FROM conversations WHERE id = ?", [q.id]);
   const ultimo = conv ? new Date(String(conv.updated_at).replace(" ", "T") + "Z").getTime() : q.creado;
   const marcar = estado => db.run("UPDATE cotizaciones SET recordatorio = ? WHERE id = ?", [estado, q.id]);
-  if (!forzar && Date.now() < horaRecordatorio(ultimo)) return "esperando (el cliente escribio hace poco)";
-  if (!forzar && Date.now() - ultimo > 23 * 3600000) { marcar("sin_ventana"); return "no enviado (pasaron mas de 24 h desde su ultimo mensaje)"; }
+  if (!forzar && !segundo && Date.now() < horaRecordatorio(ultimo)) return "esperando (el cliente escribio hace poco)";
+  if (!forzar && !segundo && Date.now() - ultimo > 23 * 3600000) { marcar("sin_ventana"); return "no enviado (pasaron mas de 24 h desde su ultimo mensaje)"; }
   if (aISO(q.llegada) <= new Date(Date.now() - MX).toISOString().slice(0, 10)) { marcar("vencida"); return "no enviado (la fecha ya paso)"; }
   const ev = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: [`contacto=${q.id}`], timeMin: new Date().toISOString(), singleEvents: true, maxResults: 1 });
   if (!forzar && (ev.data.items || []).length) { marcar("aparto"); return "no enviado (ya tiene reserva)"; }
@@ -366,13 +382,13 @@ async function recordarCotizacion(q, forzar) {
   if (!disponible) { marcar("ocupada"); return "no enviado (esas fechas ya se ocuparon)"; }
   const history = conv ? JSON.parse(conv.messages) : [];
   const hl = new Date(Date.now() - MX).getUTCHours(), saludo = hl < 12 ? "Buenos días" : hl < 19 ? "Buenas tardes" : "Buenas noches";
-  const nota = `[SISTEMA] RECORDATORIO_COTIZACION (no lo escribio el cliente). Le dijiste que la villa esta disponible del ${q.llegada} al ${q.salida}, le cotizaste y dejo de contestar. Escribele TU ahora un mensaje corto (2 a 4 lineas), calido y sin presionar, en el idioma de la conversacion. Empieza con "${saludo}" y su nombre si lo sabes, y preguntale si quiere continuar con su reserva, por ejemplo: "¿Te gustaría continuar con tu reserva? 🌿". Cuentale que esas fechas siguen disponibles por ahora, pero que no quedan apartadas hasta recibir el anticipo y el deposito en garantia, asi que otra persona podria reservarlas. Ofrecele resolver dudas o ajustar la cotizacion. No repitas la cotizacion completa, no te presentes de nuevo, no saludes como reencuentro y nunca digas SISTEMA.`;
+  const nota = segundo ? `[SISTEMA] SEGUNDO_RECORDATORIO (no lo escribio el cliente). Hace unas horas le escribiste un recordatorio por su cotizacion del ${q.llegada} al ${q.salida} y no contesto. Escribele un ultimo mensaje muy corto (2 a 3 lineas), calido y sin presionar, en el idioma de la conversacion, empezando con "${saludo}" y su nombre si lo sabes: ofrecele mandarle un resumen corto de la cotizacion para que lo comparta con su grupo, o buscar otra fecha si esa no les acomodo. Si fechas_libres muestra que en ese mes quedan 3 o menos viernes o sabados libres, puedes mencionarlo con el dato exacto. Despidete dejando la puerta abierta. No repitas la cotizacion, no te presentes y nunca digas SISTEMA.` : `[SISTEMA] RECORDATORIO_COTIZACION (no lo escribio el cliente). Le dijiste que la villa esta disponible del ${q.llegada} al ${q.salida}, le cotizaste y dejo de contestar. Escribele TU ahora un mensaje corto (2 a 4 lineas), calido y sin presionar, en el idioma de la conversacion. Empieza con "${saludo}" y su nombre si lo sabes, y preguntale si quiere continuar con su reserva, por ejemplo: "¿Te gustaría continuar con tu reserva? 🌿". Cuentale que esas fechas siguen disponibles por ahora, pero que no quedan apartadas hasta recibir el anticipo del 50% (el deposito en garantia se entrega hasta la llegada), asi que otra persona podria reservarlas. Si sabes el motivo del viaje, mencionalo. Ofrecele resolver dudas, ajustar la cotizacion o mandarle un resumen para que lo reenvie a su grupo. No repitas la cotizacion completa, no te presentes de nuevo, no saludes como reencuentro y nunca digas SISTEMA.`;
   const last = history[history.length - 1];
   if (last && last.role === "user") last.content = String(last.content) + "\n" + nota; else history.push({ role: "user", content: nota });
   let reply = "";
   try { reply = await responderConClaude(history, q.id); } catch (err) { console.error("Recordatorio cotizacion (Claude):", err.message); }
   reply = String(reply).replace(/COTIZACION_JSON:\{.*?\}|NO_INTERESADO|RESERVA_JSON[\s\S]*$|PASAR_A_HUMANO|FOTOS_CASA|FOTOS_PINATAS|ENVIAR_FOTOS|AVISO_PAGO|CALENDARIO:\S*/g, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim();
-  if (!reply || /^Dame un momento/.test(reply)) reply = `${saludo} 🌿 ¿Te gustaría continuar con tu reserva del ${q.llegada} al ${q.salida}? Esas fechas siguen disponibles por ahora, pero se apartan hasta recibir el anticipo y el depósito en garantía. Si tienes alguna duda o quieres ajustar algo, aquí estoy 😊`;
+  if (!reply || /^Dame un momento/.test(reply)) reply = `${saludo} 🌿 ¿Te gustaría continuar con tu reserva del ${q.llegada} al ${q.salida}? Esas fechas siguen disponibles por ahora, pero se apartan con el anticipo del 50%. Si tienes alguna duda o quieres ajustar algo, aquí estoy 😊`;
   marcar("enviando");
   const d = await textoWA(q.id, reply);
   if (d.status !== "success") { marcar("fallido"); return "no enviado: " + JSON.stringify(d); }
@@ -380,8 +396,9 @@ async function recordarCotizacion(q, forzar) {
   while (history.length > 40) history.shift();
   while (history.length && history[0].role !== "user") history.shift();
   db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))", [q.id, JSON.stringify(history)]);
-  marcar("enviado");
-  await bitacora("Recordatorio de cotizacion", { telefono: q.id, llegada: q.llegada, salida: q.salida, total: q.total });
+  if (segundo) marcar("enviado2");
+  else db.run("UPDATE cotizaciones SET recordatorio = 'enviado', enviado_en = ?, ultimo_cliente = ? WHERE id = ?", [Date.now(), ultimo, q.id]);
+  await bitacora(segundo ? "Segundo recordatorio de cotizacion" : "Recordatorio de cotizacion", { telefono: q.id, llegada: q.llegada, salida: q.salida, total: q.total });
   return "enviado: " + reply;
 }
 
@@ -431,7 +448,7 @@ async function enviarSeguimientos() {
 const TOOLS = [
   {
     name: "consultar_disponibilidad",
-    description: "Revisa en el calendario si la villa esta libre entre la fecha de llegada y la de salida. Usala SIEMPRE en cuanto tengas ambas fechas, antes de cotizar.",
+    description: "Revisa en el calendario si la villa esta libre entre la fecha de llegada y la de salida. Usala SIEMPRE en cuanto tengas ambas fechas, antes de cotizar. Si esta ocupada, usa fechas_libres para proponer la alternativa mas cercana.",
     input_schema: {
       type: "object",
       properties: {
@@ -445,6 +462,11 @@ const TOOLS = [
     name: "consultar_mis_reservas",
     description: "Devuelve las reservas vigentes de ESTE cliente segun el calendario real. Usala siempre que el cliente mencione su reserva, su pago, o antes de decir que ya tiene algo apartado. Si el cliente dice que la reserva la hizo con el administrador o por otro medio, pasa su nombre en el campo nombre para buscarla tambien por nombre.",
     input_schema: { type: "object", properties: { nombre: { type: "string", description: "Nombre (o apellido) del cliente tal como lo dijo, para encontrar reservas que el administrador agendo a mano" } } },
+  },
+  {
+    name: "fechas_libres",
+    description: "Devuelve las noches libres de un mes, separadas en viernes, sabados y domingo a jueves, con cuantos viernes y sabados quedan. Usala cuando la fecha que pide el cliente esta ocupada (para proponer las alternativas mas cercanas) o para saber si quedan pocos fines de semana libres.",
+    input_schema: { type: "object", properties: { mes: { type: "string", description: "AAAA-MM" } }, required: ["mes"] },
   },
 ];
 
@@ -479,6 +501,9 @@ db.run("CREATE TABLE IF NOT EXISTS seguimiento (id TEXT PRIMARY KEY, enviado_par
 db.run("CREATE TABLE IF NOT EXISTS pausas (id TEXT PRIMARY KEY, hasta INTEGER)");
 db.run("CREATE TABLE IF NOT EXISTS cotizaciones (id TEXT PRIMARY KEY, llegada TEXT, salida TEXT, total REAL, creado INTEGER, recordatorio TEXT)");
 db.run("CREATE TABLE IF NOT EXISTS no_recordar (id TEXT PRIMARY KEY)");
+db.run("ALTER TABLE cotizaciones ADD COLUMN enviado_en INTEGER", () => {});
+db.run("ALTER TABLE cotizaciones ADD COLUMN ultimo_cliente INTEGER", () => {});
+db.run("CREATE TABLE IF NOT EXISTS campanas (flow TEXT, id TEXT, enviado INTEGER, PRIMARY KEY (flow, id))");
 db.run(`CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   messages TEXT,
@@ -549,20 +574,22 @@ PAGO:
 - Banco BBVA, Cuenta 0474694074, CLABE 012680004746940744 (18 digitos, para transferencia SPEI; escribela sin espacios para que la puedan copiar), Titular Villa de Canto
 - IMPORTANTE: la cuenta de Inbursa YA NO SE USA. Si en la conversacion aparecen datos de Inbursa, aclara con amabilidad que la cuenta cambio y da los datos de BBVA
 - Si el cliente comenta que la cuenta aparece a nombre de Emilio Diaz (o pregunta a nombre de quien esta), confirmale con calidez que es correcto, que es la cuenta de Villa de Canto y puede continuar con su transferencia con toda confianza. No menciones ese nombre si el cliente no lo pregunta
-- DEPOSITO EN GARANTIA: $5,000 MXN, APARTE de la renta, reembolsable dentro de las 48 h siguientes al check-out si no hay danos ni cargos pendientes. SIEMPRE incluyelo:
-  1) En la cotizacion, despues del total, pon el bloque "PARA APARTAR TUS FECHAS" con el desglose: Anticipo 50% $X, + Deposito en garantia $5,000 (reembolsable 48 h despues de tu salida), = Total para apartar $X+5,000. Luego "Restante el dia de llegada: $Y" (el otro 50%). Usa este formato exacto, un concepto por renglon:
+- DEPOSITO EN GARANTIA: $5,000 MXN, APARTE de la renta. NO se paga al apartar: se entrega el DIA DE LLEGADA al administrador de la villa, junto con el restante, y se regresa completo dentro de las 48 h siguientes al check-out si no hay danos ni cargos pendientes. Mencionalo SIEMPRE en la cotizacion (en el bloque de abajo), explicado como tranquilidad, para que no sea sorpresa al llegar.
+- PRECIO POR PERSONA: en cada cotizacion, debajo del total de la renta, agrega un renglon con lo que sale por persona: total de la renta (con paquetes) dividido entre el numero REAL de personas que te dijo el cliente en esta conversacion (adultos + ninos), redondeado hacia arriba al peso. El 12 del ejemplo es solo ilustrativo: NUNCA uses 12 ni otro numero que el cliente no haya dicho; si no sabes cuantas personas son, preguntalo antes de cotizar. Ej.: 8 personas y renta de $26,000 -> "👉 Entre 8 personas: $3,250 por persona por toda la estancia". Los grupos dividen la cuenta y lo reenvian a su grupo de WhatsApp.
+  1) Formato exacto de la cotizacion, un concepto por renglon:
      🗓️ Viernes 14 al domingo 16 de noviembre (2 noches)
      👥 12 personas
      • Viernes 14: $12,000
      • Sábado 15: $14,000
      Total de la renta: $26,000
+     👉 Entre 12 personas: $2,167 por persona por toda la estancia
      PARA APARTAR TUS FECHAS
      Anticipo 50%: $13,000
-     + Depósito en garantía: $5,000 (reembolsable 48 h después de tu salida)
-     = Total para apartar: $18,000
      Restante el día de llegada: $13,000
-  2) Al mandar los datos bancarios, pide transferir el anticipo MAS el deposito y escribe el monto exacto a transferir (ej. "Anticipo $12,000 + Deposito en garantia $5,000 = Total a transferir: $17,000").
-  Nunca lo sumes al total de la renta ni lo cuentes dentro del 50%. Si preguntan para que es: cubre danos, faltantes o limpieza extraordinaria, y se devuelve completo si todo esta en orden.
+     Depósito en garantía el día de llegada: $5,000 (se te regresa completo 48 h después de tu salida)
+  Despues de la cotizacion cierra con UNA pregunta corta para apartar (ver CIERRE).
+  2) Al mandar los datos bancarios, pide transferir SOLO el anticipo del 50% y escribe el monto exacto (ej. "Total a transferir para apartar: $13,000"). Recuerdale en una frase que el restante y el deposito en garantia se entregan el dia de llegada.
+  Nunca sumes el deposito al total de la renta, al anticipo ni al precio por persona. Si preguntan para que es: es solo un respaldo por danos, faltantes o limpieza extraordinaria, y casi siempre se regresa integro.
 
 REGLAS:
 - No des descuentos
@@ -578,9 +605,21 @@ LONGITUD: estas en WhatsApp. Responde CORTO, maximo 4-6 lineas por mensaje, como
 
 EXTRACCION DE DATOS: el cliente puede darte varios datos en un solo mensaje o uno por uno. Lee todo el mensaje y extrae nombre, fechas, adultos, ninos y motivo sin importar el orden o formato. Nunca vuelvas a pedir un dato que ya te dio. SIEMPRE responde algo a cada mensaje.
 
-FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo de forma natural, consulta disponibilidad, calcula noches y total, presenta cotizacion (incluye el deposito en garantia), si acepta manda datos bancarios con el monto a transferir (anticipo + deposito en garantia) y pide que envie la foto de su comprobante por este chat y que despues escriba "listo" para avisarte. Si el cliente escribe "listo" (o similar) despues de los datos bancarios, tomalo como aviso de pago.
+FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo de forma natural, consulta disponibilidad, calcula noches y total, presenta cotizacion (con precio por persona y el deposito en garantia a la llegada) y cierra con una pregunta para apartar; si acepta manda datos bancarios con el monto a transferir (solo el anticipo del 50%) y pide que envie la foto de su comprobante por este chat y que despues escriba "listo" para avisarte. Si el cliente escribe "listo" (o similar) despues de los datos bancarios, tomalo como aviso de pago.
 
-NO SEAS INSISTENTE: si el cliente solo esta preguntando (fotos, servicios, ubicacion, habitaciones, precios, paquetes, horarios), responde su pregunta y ya. NO termines cada mensaje preguntando por fechas o si quiere reservar. Maximo menciona la reserva UNA vez en toda la conversacion, de forma suave, y solo despues de haber resuelto varias dudas. Si el cliente ya dijo que solo esta viendo o que despues te avisa, no vuelvas a ofrecer reservar a menos que el lo pida. Deja que el cliente lleve el ritmo, como lo haria un buen anfitrion.
+NO SEAS INSISTENTE, PERO SI CIERRA: si el cliente solo esta preguntando cosas generales (fotos, servicios, ubicacion, habitaciones, precios en general, paquetes, horarios) sin fechas, responde su pregunta y ya; no termines cada mensaje preguntando por fechas. Si el cliente ya dijo que solo esta viendo o que despues te avisa, no vuelvas a ofrecer reservar a menos que el lo pida. Deja que el cliente lleve el ritmo, como lo haria un buen anfitrion.
+
+CIERRE: en cuanto el cliente te dio fechas concretas y le mandaste la cotizacion, ya no esta solo viendo: esta comparando opciones. Termina ese mensaje con UNA pregunta corta y calida para apartar, usando la fecha y el motivo, ej. "¿Te aparto el sábado 22 para el cumple? 🌿 Con el anticipo queda bloqueado solo para ustedes." Si responde con dudas, resuelvelas y vuelve a ofrecer apartar una sola vez mas. Nunca uses presion falsa ("ultima oportunidad", "solo hoy").
+
+VENDE LA EXPERIENCIA: el cliente no compra noches, compra un festejo o un descanso. Usa el motivo que te dio para conectar con lo que mas le va a servir, en una frase y sin listar todo: cumpleanos o festejo de adultos -> alberca climatizada hasta la noche, asador, rocola y karaoke; familia con ninos -> alberca climatizada 33-35 C, area de juegos, fiesta infantil; descanso o grupo de amigos -> tranquilidad, Ruta del Queso y Vino, masajes; posada o empresa -> casa completa solo para ellos, asador, horno de pizza, karaoke; con mascotas -> pet friendly. Hazlo al presentar la cotizacion o justo antes, no en cada mensaje.
+
+FECHA OCUPADA: si consultar_disponibilidad dice que esta ocupada, NO te quedes en "busquemos otras fechas". Usa fechas_libres de ese mes y propone las 2 alternativas MAS CERCANAS del mismo tipo (si pidio sabado: el viernes anterior o el sabado siguiente; si pidio fin de semana: el fin de semana libre mas cercano), confirma con consultar_disponibilidad la que el cliente elija y ofrece mandarle el calendario del mes.
+
+ESCASEZ REAL: si el cliente pide viernes o sabado y fechas_libres muestra que en ese mes quedan 3 o menos viernes o sabados libres, dilo UNA vez con el dato exacto (ej. "de diciembre solo me quedan 2 sábados libres 🗓️"). Solo si es cierto segun la herramienta; nunca inventes que otras personas estan preguntando por la misma fecha.
+
+CONFIANZA: antes de pagar, el cliente quiere saber que la villa existe y es como en las fotos. Si pregunta la ubicacion, si duda en transferir o al mandar los datos bancarios, comparte el link de Google Maps (https://www.google.com/maps?q=20.6901757,-100.2620513)${process.env.LINK_VIDEO ? `, el video del recorrido (${process.env.LINK_VIDEO})` : ""}${process.env.LINK_RESENAS ? ` y las reseñas de otros huespedes (${process.env.LINK_RESENAS})` : ""}, y recuerdale que solo aparta con el 50% y que el deposito se entrega hasta la llegada. Nunca inventes links ni reseñas.
+
+${process.env.EXTRA_ENTRE_SEMANA ? `ENTRE SEMANA: si el cliente tiene flexibilidad de fechas, pregunta por algo mas economico, o es posada, empresa o familia en vacaciones, comentale que de domingo a jueves la noche esta en $10,500 y que en esas estancias se incluye: ${process.env.EXTRA_ENTRE_SEMANA}. Solo aplica si TODAS las noches de la estancia son de domingo a jueves. No es descuento: no cambies tarifas.` : "ENTRE SEMANA: si el cliente tiene flexibilidad de fechas o pregunta por algo mas economico, comentale que de domingo a jueves la noche esta en $10,500."}
 
 CUANDO el cliente confirme que quiere reservar (y ya consultaste disponibilidad y esta libre), agrega al FINAL de tu respuesta, en su propia linea, exactamente esto (el cliente no lo vera):
 RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"...","paquetes":"...","total":N}
@@ -617,7 +656,7 @@ ${process.env.LUGARES_CERCA || `- Pueblo de Amazcala (a unos minutos en coche, j
 - Supermercado grande (Bodega Aurrerá, etc.): está hacia la zona de El Marqués / Hacienda La Cruz; sugiere que hagan el súper grande en Querétaro antes de llegar
 Las distancias son aproximadas; dilas como "unos X minutos".`}
 
-MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el deposito. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada (menciona en una frase que su deposito en garantia de $5,000 se le reembolsa dentro de las 48 h siguientes a su salida si todo esta en orden). Luego, en tono cercano (NO como lista de tareas ni "Para terminar"), dile que el administrador de la villa los recibira a su llegada y, para facilitarles todo, llenaran juntos el contrato digital en ese momento (toma solo 2 minutos); que por favor tengan a la mano su INE, ya que se requiere para el contrato. NO mandes ningun link de contrato y NO pidas la INE por este chat. Despues dale los datos de llegada: direccion, link de ubicacion en Google Maps (https://www.google.com/maps?q=20.6901757,-100.2620513), check-in 13:00, check-out 12:00, y el numero del administrador de la villa (442 874 2383): con el se verifica cualquier persona extra o cambio de horario de entrada o salida. Nunca menciones la palabra SISTEMA.`;
+MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el pago del anticipo. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada (menciona en una frase que el dia de llegada se entrega el restante y el deposito en garantia de $5,000, que se le regresa completo dentro de las 48 h siguientes a su salida si todo esta en orden). Luego, en tono cercano (NO como lista de tareas ni "Para terminar"), dile que el administrador de la villa los recibira a su llegada y, para facilitarles todo, llenaran juntos el contrato digital en ese momento (toma solo 2 minutos); que por favor tengan a la mano su INE, ya que se requiere para el contrato. NO mandes ningun link de contrato y NO pidas la INE por este chat. Despues dale los datos de llegada: direccion, link de ubicacion en Google Maps (https://www.google.com/maps?q=20.6901757,-100.2620513), check-in 13:00, check-out 12:00, y el numero del administrador de la villa (442 874 2383): con el se verifica cualquier persona extra o cambio de horario de entrada o salida. Nunca menciones la palabra SISTEMA.`;
 }
 
 async function responderConClaude(history, contacto) {
@@ -644,6 +683,9 @@ async function responderConClaude(history, contacto) {
           const lista = await reservasDelCliente(contacto, b.input && b.input.nombre);
           out = { reservas: lista, nota: lista.length ? "Estas son sus unicas reservas vigentes" : "No tiene reservas vigentes (si hablaron de una antes, fue cancelada)" };
           console.log("Reservas de", contacto, ":", lista.length);
+        } else if (b.name === "fechas_libres") {
+          out = await fechasLibres(b.input.mes);
+          console.log("Fechas libres", b.input.mes, ":", out.viernes_libres, "viernes /", out.sabados_libres, "sabados");
         } else {
           out = await consultarDisponibilidad(b.input.llegada, b.input.salida);
           console.log("Disponibilidad", b.input.llegada, "-", b.input.salida, out.disponible ? "LIBRE" : "OCUPADO");
@@ -1211,6 +1253,22 @@ async function diasOcupados(y, m) {
   }
   return set;
 }
+async function fechasLibres(mes) {
+  const [y, m] = (String(mes).match(/^(\d{4})-(\d{2})/) || []).slice(1).map(Number);
+  if (!y || !m) return { error: "Usa el formato AAAA-MM" };
+  const ocupados = await diasOcupados(y, m), hoy = new Date(Date.now() - MX).toISOString().slice(0, 10);
+  const out = { mes: `${y}-${String(m).padStart(2, "0")}`, viernes: [], sabados: [], domingo_a_jueves: [] };
+  const dias = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  for (let d = 1; d <= dias; d++) {
+    const iso = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    if (iso < hoy || ocupados.has(iso)) continue;
+    const dw = new Date(Date.UTC(y, m - 1, d)).getUTCDay(), f = iso.slice(8, 10) + "/" + iso.slice(5, 7);
+    (dw === 5 ? out.viernes : dw === 6 ? out.sabados : out.domingo_a_jueves).push(f);
+  }
+  out.viernes_libres = out.viernes.length; out.sabados_libres = out.sabados.length;
+  out.nota = "Cada fecha es una NOCHE libre (llegada ese dia, salida al dia siguiente). Antes de cotizar una alternativa, confirmala con consultar_disponibilidad.";
+  return out;
+}
 function svgCalendario(y, m, ocupados) {
   const W = 1080, H = 1350, X0 = 48, GW = 984, cw = GW / 7, hoy = new Date(Date.now() - MX).toISOString().slice(0, 10);
   const dias = new Date(Date.UTC(y, m, 0)).getUTCDate(), off = (new Date(Date.UTC(y, m - 1, 1)).getUTCDay() + 6) % 7;
@@ -1366,7 +1424,7 @@ async function analizarConClaude(convs) {
   const texto = abiertas.map(c => `### ID ${c.id} | etapa: ${ETAPAS[c.etapa]} | ultimo mensaje de: ${c.sinRespuesta ? "CLIENTE (Vero no contesto)" : "Vero"} | hace ${Math.round(c.horas)} h\n` + c.msgs.slice(-14).map(m => `${m.r === "user" ? "C" : "V"}: ${m.t.slice(0, 280)}`).join("\n")).join("\n\n");
   const r = await client.messages.create({
     model: "claude-sonnet-5", max_tokens: 8000, thinking: { type: "disabled" },
-    system: "Eres el analista comercial de Villa de Canto (casa de descanso en Amazcala, Queretaro, para hasta 20 personas; tarifas $10,500 dom-jue, $12,000 viernes, $14,000 sabado; anticipo $5,000 + deposito $5,000). Vero es la asistente de IA que atiende WhatsApp. Revisa conversaciones que NO terminaron en reserva y explica con honestidad por que se cayeron (precio, fechas ocupadas, Vero contesto mal o lento, Vero no contesto, falta de seguimiento, cliente solo cotizaba, etc.). Responde SOLO un JSON valido, sin texto extra, con esta forma: {\"resumen\":\"2-3 frases\",\"causas\":[{\"causa\":\"\",\"cuantas\":0,\"solucion\":\"\"}],\"cambios_vero\":[\"cambio concreto a las instrucciones de Vero\"],\"conversaciones\":[{\"id\":\"\",\"motivo\":\"1 frase\",\"accion\":\"que debe hacer el administrador\",\"mensaje\":\"mensaje corto y calido para reenganchar por WhatsApp, o vacio si no conviene\"}]}. Maximo 6 causas y 6 cambios, ordenados por impacto.",
+    system: "Eres el analista comercial de Villa de Canto (casa de descanso en Amazcala, Queretaro, para hasta 20 personas; tarifas $10,500 dom-jue, $12,000 viernes, $14,000 sabado; para apartar 50% de anticipo; el deposito en garantia de $5,000 se entrega a la llegada). Vero es la asistente de IA que atiende WhatsApp. Revisa conversaciones que NO terminaron en reserva y explica con honestidad por que se cayeron (precio, fechas ocupadas, Vero contesto mal o lento, Vero no contesto, falta de seguimiento, cliente solo cotizaba, etc.). Responde SOLO un JSON valido, sin texto extra, con esta forma: {\"resumen\":\"2-3 frases\",\"causas\":[{\"causa\":\"\",\"cuantas\":0,\"solucion\":\"\"}],\"cambios_vero\":[\"cambio concreto a las instrucciones de Vero\"],\"conversaciones\":[{\"id\":\"\",\"motivo\":\"1 frase\",\"accion\":\"que debe hacer el administrador\",\"mensaje\":\"mensaje corto y calido para reenganchar por WhatsApp, o vacio si no conviene\"}]}. Maximo 6 causas y 6 cambios, ordenados por impacto.",
     messages: [{ role: "user", content: `Hoy es ${hoyMexico()}. Conversaciones abiertas:\n\n${texto}` }],
   });
   const raw = r.content.filter(b => b.type === "text").map(b => b.text).join("");
@@ -1404,6 +1462,116 @@ app.get("/revisar", async (req, res) => {
     res.send(html);
   } catch (e) { console.error("Revisar:", e.message); res.status(500).send("Error al revisar: " + esc(e.message)); }
 });
+
+// ===== AGENTE DE MARKETING: reporte mensual con recomendaciones para cerrar mas reservas =====
+// https://TU-APP.up.railway.app/marketing?clave=TU_CLAVE  (&mes=2026-10 para otro mes, &nuevo=1 para rehacerlo)
+db.run("CREATE TABLE IF NOT EXISTS reportes_marketing (mes TEXT PRIMARY KEY, html TEXT, creado DATETIME DEFAULT CURRENT_TIMESTAMP)");
+const mesMX = (offset = 0) => { const d = new Date(Date.now() - MX); d.setUTCDate(1); d.setUTCMonth(d.getUTCMonth() + offset); return d.toISOString().slice(0, 7); };
+const NOMBRE_MES = m => new Date(m + "-15T12:00:00Z").toLocaleDateString("es-MX", { month: "long", year: "numeric", timeZone: "UTC" });
+async function datosMes(mes) {
+  const [y, m] = mes.split("-").map(Number);
+  const ini = `${mes}-01 00:00:00`, fin = new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 10) + " 00:00:00";
+  const dias = Math.ceil((Date.now() - Date.parse(mes + "-01T06:00:00Z")) / 86400000) + 1;
+  const todas = await datosRevision(Math.min(400, Math.max(1, dias)));
+  const ids = await new Promise(ok => db.all("SELECT id FROM conversations WHERE created_at >= ? AND created_at < ?", [ini, fin], (e, r) => ok(new Set((r || []).map(x => String(x.id))))));
+  return todas.filter(c => ids.has(c.id));
+}
+async function analizarMarketing(mes, convs) {
+  const embudo = ETAPAS.map((n, i) => `${n}: ${convs.filter(c => c.etapa === i).length}`).join(" | ");
+  const cerradas = convs.filter(c => c.etapa === 6).length, conv = convs.length ? Math.round(cerradas / convs.length * 100) : 0;
+  const muestra = [...convs].sort((a, b) => b.etapa - a.etapa).slice(0, 70);
+  const texto = muestra.map(c => `### ${c.id} | etapa: ${ETAPAS[c.etapa]}${c.sinRespuesta ? " | Vero no contesto" : ""}\n` + c.msgs.slice(0, 20).map(m => `${m.r === "user" ? "C" : "V"}: ${m.t.slice(0, 240)}`).join("\n")).join("\n\n");
+  const r = await client.messages.create({
+    model: "claude-sonnet-5", max_tokens: 10000, thinking: { type: "disabled" },
+    system: `Eres un experto en marketing y ventas de hospedaje vacacional en Mexico (Airbnb, casas de descanso, eventos). Asesoras a Villa de Canto: casa de descanso en Campestre Amazcala, El Marques, Queretaro (Ruta del Queso y Vino, a 30 min del centro), hasta 15 personas con tarifa normal y hasta 20 con cargo extra, alberca, pet friendly, ideal para cumpleanos, familias y grupos de amigos. Tarifas por noche: $10,500 dom-jue, $12,000 viernes, $14,000 sabado. Para apartar: solo 50% de anticipo; el restante y el deposito en garantia de $5,000 (reembolsable) se entregan a la llegada. Vero ya cierra con una pregunta para apartar, da precio por persona, propone fechas alternativas, menciona escasez real y manda un segundo recordatorio. Vero es la asistente de IA que atiende WhatsApp; los clientes llegan por Instagram, TikTok, Facebook y Airbnb.
+Analiza las conversaciones del mes como un consultor: patrones de lo que piden los clientes, en que paso abandonan, objeciones (precio, deposito, fechas, capacidad, ubicacion, desconfianza), temporadas y dias mas pedidos, tipo de grupo y motivo del viaje, y como responde Vero. Da recomendaciones CONCRETAS, accionables y realistas para un negocio pequeno, basadas en lo que viste (cita ejemplos reales resumidos, nunca nombres ni telefonos). No inventes cifras que no esten en los datos.
+Responde SOLO un JSON valido con esta forma:
+{"resumen":"3-4 frases para el dueno","hallazgos":[{"titulo":"","detalle":"","evidencia":"ejemplo resumido de una conversacion"}],"objeciones":[{"objecion":"","veces":0,"respuesta_sugerida":"texto listo para que Vero lo use"}],"recomendaciones":[{"accion":"","por_que":"","impacto":"alto|medio|bajo","esfuerzo":"bajo|medio|alto"}],"promociones":[{"nombre":"","mecanica":"","para_quien":""}],"contenido":[{"red":"TikTok|Instagram|Facebook","idea":"","gancho":"primera frase del video o post"}],"cambios_vero":["cambio concreto a las instrucciones de Vero"],"plan":[{"semana":"Semana 1","tareas":["",""]}],"meta_proximo_mes":"una meta medible"}
+Maximo: 5 hallazgos, 5 objeciones, 7 recomendaciones (ordenadas por impacto), 3 promociones, 5 ideas de contenido, 5 cambios a Vero, 4 semanas de plan.`,
+    messages: [{ role: "user", content: `Mes analizado: ${NOMBRE_MES(mes)}. Hoy: ${hoyMexico()}.\nConversaciones nuevas: ${convs.length}. Reservas confirmadas: ${cerradas} (${conv}%).\nEmbudo (etapa maxima alcanzada): ${embudo}\nSin respuesta de Vero: ${convs.filter(c => c.sinRespuesta).length}\n\nConversaciones:\n\n${texto || "(sin conversaciones)"}` }],
+  });
+  const raw = r.content.filter(b => b.type === "text").map(b => b.text).join("");
+  try { return { ...JSON.parse(raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1)), cerradas, conv }; }
+  catch { return { resumen: raw.slice(0, 800), cerradas, conv }; }
+}
+function htmlMarketing(mes, convs, a) {
+  const L = "2px solid #1b2b34", gris = "color:#4b5a62", sec = t => `<h2 style="font-size:28px;margin:0;padding-bottom:10px;border-bottom:${L}">${t}</h2>`;
+  const tag = (t, fuerte) => `<span style="display:inline-block;padding:2px 8px;font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;${fuerte ? "background:#1b2b34;color:#e2d6cb" : `border:${L}`}">${esc(t)}</span>`;
+  const max = Math.max(1, ...ETAPAS.map((_, i) => convs.filter(c => c.etapa >= i).length));
+  const embudo = ETAPAS.map((n, i) => { const c = convs.filter(x => x.etapa >= i).length; return `<div style="display:grid;grid-template-columns:200px 1fr 50px;gap:12px;align-items:center;padding:6px 0"><span>${esc(n)}</span><div style="height:22px;background:#1b2b34;width:${Math.max(2, c / max * 100)}%"></div><b>${c}</b></div>`; }).join("");
+  const kpi = [["Conversaciones nuevas", convs.length], ["Reservas confirmadas", a.cerradas], ["Conversión", a.conv + "%"], ["Sin respuesta de Vero", convs.filter(c => c.sinRespuesta).length]];
+  const lista = (arr, f) => (arr || []).map(f).join("");
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Marketing ${esc(NOMBRE_MES(mes))} · Villa de Canto</title><style>body{margin:0;background:#e2d6cb;color:#1b2b34;font-family:Archivo,Helvetica,Arial,sans-serif;line-height:1.45}a{color:#24597a}a:hover{color:#1b2b34}</style></head><body><div style="max-width:1180px;margin:0 auto;padding:40px 24px;display:flex;flex-direction:column;gap:40px">
+<div style="border-bottom:${L};padding-bottom:20px"><div style="font-weight:700;letter-spacing:.12em;color:#2e6f90">VILLA DE CANTO · REPORTE DE MARKETING</div><h1 style="font-size:52px;margin:8px 0 0;line-height:1;text-transform:capitalize">${esc(NOMBRE_MES(mes))}</h1></div>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));border-top:${L};border-left:${L}">${kpi.map(([n, c]) => `<div style="padding:18px;border-right:${L};border-bottom:${L}"><div style="font-size:40px;font-weight:700">${esc(c)}</div><div style="font-size:14px;${gris}">${n}</div></div>`).join("")}</div>
+<div style="font-size:21px">${esc(a.resumen || "")}</div>
+${a.meta_proximo_mes ? `<div style="background:#1b2b34;color:#e2d6cb;padding:24px"><div style="font-size:13px;font-weight:700;letter-spacing:.12em">META DEL PRÓXIMO MES</div><div style="font-size:24px;font-weight:700;margin-top:6px">${esc(a.meta_proximo_mes)}</div></div>` : ""}
+<div>${sec("Dónde se pierden los clientes")}<div style="padding-top:12px">${embudo}</div></div>
+<div>${sec("Recomendaciones")}${lista(a.recomendaciones, (r, i) => `<div style="display:grid;grid-template-columns:48px 1fr auto;gap:16px;padding:16px 0;border-bottom:${L}"><div style="font-size:28px;font-weight:700">${i + 1}</div><div><b style="font-size:18px">${esc(r.accion)}</b><div style="${gris};margin-top:4px">${esc(r.por_que)}</div></div><div style="display:flex;flex-direction:column;gap:6px;align-items:flex-start">${tag("Impacto " + (r.impacto || ""), r.impacto === "alto")}${tag("Esfuerzo " + (r.esfuerzo || ""))}</div></div>`)}</div>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:40px">
+<div>${sec("Lo que encontramos")}${lista(a.hallazgos, h => `<div style="padding:14px 0;border-bottom:${L}"><b>${esc(h.titulo)}</b><div style="margin-top:4px">${esc(h.detalle)}</div>${h.evidencia ? `<div style="${gris};font-size:14px;margin-top:6px">Ej.: ${esc(h.evidencia)}</div>` : ""}</div>`)}</div>
+<div>${sec("Objeciones y cómo responderlas")}${lista(a.objeciones, o => `<div style="padding:14px 0;border-bottom:${L}"><b>${esc(o.objecion)}</b> <span style="${gris}">· ${esc(o.veces)} veces</span><div style="background:#f5efe9;padding:10px;margin-top:8px">${esc(o.respuesta_sugerida)}</div></div>`)}</div></div>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:40px">
+<div>${sec("Promociones sugeridas")}${lista(a.promociones, p => `<div style="padding:14px 0;border-bottom:${L}"><b>${esc(p.nombre)}</b><div style="margin-top:4px">${esc(p.mecanica)}</div><div style="${gris};font-size:14px;margin-top:4px">Para: ${esc(p.para_quien)}</div></div>`)}</div>
+<div>${sec("Ideas de contenido")}${lista(a.contenido, c => `<div style="padding:14px 0;border-bottom:${L}">${tag(c.red, true)}<div style="margin-top:8px"><b>"${esc(c.gancho)}"</b></div><div style="${gris};margin-top:4px">${esc(c.idea)}</div></div>`)}</div></div>
+<div>${sec("Plan del mes")}<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));border-left:${L}">${lista(a.plan, s => `<div style="padding:16px;border-right:${L};border-bottom:${L}"><b>${esc(s.semana)}</b><ul style="margin:8px 0 0;padding-left:18px">${(s.tareas || []).map(t => `<li>${esc(t)}</li>`).join("")}</ul></div>`)}</div></div>
+<div>${sec("Cambios sugeridos a Vero")}${lista(a.cambios_vero, c => `<div style="padding:12px 0;border-bottom:${L}">${esc(c)}</div>`)}</div>
+<div style="${gris};font-size:13px">Generado ${esc(new Date().toLocaleString("es-MX", { timeZone: "America/Mexico_City" }))} con ${convs.length} conversaciones. Agrega &amp;nuevo=1 para rehacerlo o &amp;mes=AAAA-MM para otro mes.</div></div></body></html>`;
+}
+async function generarMarketing(mes) {
+  const convs = await datosMes(mes);
+  const html = htmlMarketing(mes, convs, await analizarMarketing(mes, convs));
+  db.run("INSERT OR REPLACE INTO reportes_marketing (mes, html) VALUES (?, ?)", [mes, html]);
+  console.log("Reporte de marketing generado:", mes, convs.length, "conversaciones");
+  return html;
+}
+app.get("/marketing", async (req, res) => {
+  if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave: /marketing?clave=...");
+  const mes = /^\d{4}-\d{2}$/.test(String(req.query.mes || "")) ? req.query.mes : mesMX(0);
+  try {
+    if (!req.query.nuevo) { const g = await new Promise(ok => db.get("SELECT html FROM reportes_marketing WHERE mes = ?", [mes], (e, r) => ok(r))); if (g) return res.send(g.html); }
+    res.send(await generarMarketing(mes));
+  } catch (e) { console.error("Marketing:", e.message); res.status(500).send("Error en el reporte: " + esc(e.message)); }
+});
+// CAMPAÑA a contactos pasados (flujo de ManyChat con plantilla de WhatsApp aprobada en Meta)
+// Vista previa: /campana?clave=CLAVE&flow=content2026...   Enviar: agrega &enviar=1   Opcional: &dias=365 (antiguedad maxima)
+app.get("/campana", async (req, res) => {
+  if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave: /campana?clave=...");
+  const flow = String(req.query.flow || process.env.MANYCHAT_FLOW_CAMPANA || "");
+  if (!flow) return res.type("text/plain").send("❌ Falta &flow=ID_DEL_FLUJO (o MANYCHAT_FLOW_CAMPANA en Railway)");
+  const dias = Math.min(730, Math.max(1, Number(req.query.dias) || 365));
+  try {
+    const filas = await new Promise(ok => db.all("SELECT id FROM conversations WHERE updated_at >= datetime('now', ?) AND id NOT IN (SELECT id FROM no_recordar)", [`-${dias} days`], (e, r) => ok(e ? [] : r || [])));
+    const ya = new Set((await new Promise(ok => db.all("SELECT id FROM campanas WHERE flow = ?", [flow], (e, r) => ok(e ? [] : r || [])))).map(x => String(x.id)));
+    const ev = await calendar.events.list({ calendarId: CALENDAR_ID, timeMin: new Date().toISOString(), singleEvents: true, maxResults: 250 });
+    const conReserva = new Set((ev.data.items || []).map(e => String(e.extendedProperties?.private?.contacto || "")));
+    const lista = filas.map(f => String(f.id)).filter(id => !ya.has(id) && !conReserva.has(id)).slice(0, 250);
+    if (req.query.enviar !== "1") return res.type("text/plain").send(`Vista previa: se enviaria el flujo ${flow} a ${lista.length} contactos (ultimos ${dias} dias, sin reserva futura, sin "no me escriban", sin envio previo de este flujo).\nPara enviar agrega &enviar=1`);
+    let ok = 0, mal = 0;
+    for (const id of lista) {
+      let d = {};
+      try { d = await manychat("sendFlow", { subscriber_id: id, flow_ns: flow }); } catch (e) { d = { status: "error" }; }
+      if (d.status === "success") { ok++; db.run("INSERT OR REPLACE INTO campanas (flow, id, enviado) VALUES (?, ?, ?)", [flow, id, Date.now()]); } else mal++;
+      await new Promise(r => setTimeout(r, 400));
+    }
+    await bitacora("Campaña", { flujo: flow, enviados: ok, fallidos: mal });
+    res.type("text/plain").send(`✅ Enviados: ${ok} | Fallidos: ${mal}${lista.length === 250 ? "\nHay mas contactos: vuelve a abrir la liga con &enviar=1 para el siguiente bloque." : ""}`);
+  } catch (e) { res.status(500).type("text/plain").send("Error: " + e.message); }
+});
+// El dia 1 de cada mes (9:00 Mexico) se genera solo el reporte del mes anterior y se avisa a los administradores
+async function marketingMensual() {
+  const d = new Date(Date.now() - MX); if (d.getUTCDate() !== 1 || d.getUTCHours() < 9) return;
+  const mes = mesMX(-1);
+  const ya = await new Promise(ok => db.get("SELECT mes FROM reportes_marketing WHERE mes = ?", [mes], (e, r) => ok(r)));
+  if (ya) return;
+  await generarMarketing(mes);
+  const link = `${URL_PUBLICA}/marketing?mes=${mes}${process.env.CLAVE_REVISION ? "&clave=" + encodeURIComponent(process.env.CLAVE_REVISION) : ""}`;
+  for (const admin of ADMINS_AVISO) {
+    const s = await textoWA(admin, `📊 Ya está tu reporte de marketing de ${NOMBRE_MES(mes)} con recomendaciones para cerrar más reservas:\n${link}`).catch(e => ({ status: e.message }));
+    console.log("Reporte de marketing enviado a", admin, s && s.status);
+  }
+}
+setInterval(() => marketingMensual().catch(e => console.error("Marketing mensual:", e.message)), 60 * 60 * 1000);
 
 const server = app.listen(PORT, () => console.log(`Agente Vero en puerto ${PORT}`));
 setInterval(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 60 * 60 * 1000);
