@@ -121,6 +121,29 @@ function solapaEstancia(e, llegadaISO, salidaISO) {
 }
 const sigDia = iso => new Date(Date.parse(iso + "T12:00:00Z") + 86400000).toISOString().slice(0, 10);
 
+// Dias festivos y puentes (Mexico): noches de alta demanda donde se piden minimo 2 noches. Editar aqui cada año.
+const FESTIVOS = [
+  { nombre: "puente de la Revolucion", noches: ["2026-11-13", "2026-11-14", "2026-11-15"] },
+  { nombre: "Navidad", noches: ["2026-12-24", "2026-12-25", "2026-12-26"] },
+  { nombre: "Año Nuevo", noches: ["2026-12-31", "2027-01-01", "2027-01-02"] },
+  { nombre: "puente del Dia de la Constitucion", noches: ["2027-01-29", "2027-01-30", "2027-01-31"] },
+  { nombre: "puente de Natalicio de Benito Juarez", noches: ["2027-03-12", "2027-03-13", "2027-03-14"] },
+  { nombre: "Semana Santa", noches: ["2027-03-24", "2027-03-25", "2027-03-26", "2027-03-27"] },
+  { nombre: "puente del 1 de mayo", noches: ["2027-04-30", "2027-05-01"] },
+  { nombre: "fiestas patrias", noches: ["2027-09-15", "2027-09-16", "2027-09-17", "2027-09-18"] },
+  { nombre: "puente de Dia de Muertos", noches: ["2027-10-29", "2027-10-30", "2027-10-31", "2027-11-01"] },
+  { nombre: "puente de la Revolucion", noches: ["2027-11-12", "2027-11-13", "2027-11-14"] },
+  { nombre: "Navidad", noches: ["2027-12-24", "2027-12-25"] },
+  { nombre: "Año Nuevo", noches: ["2027-12-31", "2028-01-01"] },
+];
+// Si la estancia toca una noche festiva y es de menos de 2 noches, devuelve el nombre del festivo
+function festivoConMinimo(llegada, salida) {
+  const ll = aISO(llegada), sa = aISO(salida), noches = [];
+  for (let d = ll; d < sa && noches.length < 60; d = sigDia(d)) noches.push(d);
+  const f = FESTIVOS.find(x => x.noches.some(n => noches.includes(n)));
+  return f && noches.length < 2 ? f.nombre : null;
+}
+
 // Doble verificacion: consulta el calendario 2 veces (con 1.5 s de pausa); si alguna dice ocupado, esta ocupado
 async function consultarDisponibilidad(llegada, salida) {
   const v1 = await consultarUnaVez(llegada, salida);
@@ -462,7 +485,7 @@ async function recordarCotizacion(q, forzar, segundo) {
   if (last && last.role === "user") last.content = String(last.content) + "\n" + nota; else history.push({ role: "user", content: nota });
   let reply = "";
   try { reply = await responderConClaude(history, q.id); } catch (err) { console.error("Recordatorio cotizacion (Claude):", err.message); }
-  reply = String(reply).replace(/COTIZACION_JSON:\{.*?\}|NO_INTERESADO|RESERVA_JSON[\s\S]*$|PASAR_A_HUMANO|FOTOS_CASA|FOTOS_PINATAS|ENVIAR_FOTOS|AVISO_PAGO|CALENDARIO:\S*/g, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim();
+  reply = String(reply).replace(/COTIZACION_JSON:\{.*?\}|NO_INTERESADO|RESERVA_JSON[\s\S]*$|PASAR_A_HUMANO|FOTOS_ESPECIFICAS:[^\n]*|FOTOS_CASA|FOTOS_PINATAS|ENVIAR_FOTOS|AVISO_PAGO|CALENDARIO:\S*/g, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim();
   if (!reply || /^Dame un momento/.test(reply)) reply = `${saludo} 🌿 ¿Te gustaría continuar con tu reserva del ${q.llegada} al ${q.salida}? Esas fechas siguen disponibles por ahora, pero se apartan con el anticipo del 50%. Si tienes alguna duda o quieres ajustar algo, aquí estoy 😊`;
   marcar("enviando");
   const d = await textoWA(q.id, reply);
@@ -606,6 +629,12 @@ NUNCA INVENTES DATOS: usa solo lo que el cliente escribio literalmente. Si dice 
 
 DISPONIBILIDAD PRIMERO (REGLA NUMERO 1): en cuanto el cliente mencione CUALQUIER fecha (un dia, "del 3 al 5", "el sabado", "fin de semana", "2 noches", "mañana"), lo PRIMERO que haces es usar consultar_disponibilidad, ANTES de preguntar nombre, adultos, ninos, motivo o de dar precios. Si solo te dio la llegada, consulta esa noche (salida = dia siguiente) y si dijo cuantas noches, usa esas noches. Si esta OCUPADO: dilo de inmediato en tu respuesta, NO preguntes cuantas personas son ni des precios para esas fechas; usa fechas_libres y propone las 2 alternativas mas cercanas. Solo si esta LIBRE sigues con las preguntas para cotizar. Si el cliente cambia de fechas, vuelve a consultar. Nunca digas que hay disponibilidad sin haberla consultado en este momento (lo que se dijo antes en la conversacion puede haber cambiado).
 
+SOLO DIO LA LLEGADA: si el cliente da un solo dia ("quiero reservar el 24 de diciembre", "para el sabado 15") y no dice la salida, NO le preguntes primero la salida ni cuantas noches. Usa consultar_disponibilidad AHORA con esa noche (llegada = ese dia, salida = el dia siguiente). Si esta OCUPADA, dile con calidez que esa fecha ya esta reservada y propone 2 alternativas libres cercanas (usa fechas_libres), sin preguntar salida ni personas. Si esta LIBRE, dile que ese dia esta disponible y entonces preguntale cuantas noches se quedaria.
+
+NUNCA OFREZCAS NOCHES SIN REVISAR: antes de proponer, sugerir o mencionar CUALQUIER fecha o noche concreta (alternativas, entre semana, otro fin de semana, Navidad, Año Nuevo, puentes, "tengo libre el..."), revisala con consultar_disponibilidad o fechas_libres. Si el cliente pregunta por un mes ("precios para diciembre"), usa fechas_libres de ese mes ANTES de responder y solo menciona fechas que esten libres; si Navidad o Año Nuevo ya estan ocupados, no los menciones. Si no puedes revisar el calendario, da solo los precios por noche sin ofrecer fechas.
+
+FESTIVOS Y PUENTES: en dias festivos y puentes (Revolucion, Navidad, Año Nuevo, Constitucion, Benito Juarez, Semana Santa, 1 de mayo, fiestas patrias, Dia de Muertos) la estancia minima es de 2 noches. Si consultar_disponibilidad trae minimo_2_noches, explicaselo con calidez ("para esas fechas, por la alta demanda, manejamos un minimo de 2 noches") y ofrece la opcion de 2 noches mas cercana. Nunca cotices 1 noche en esas fechas.
+
 DATOS:
 - Capacidad y personas adicionales: se cuentan TODAS las personas (adultos + ninos). Hasta 15 personas en total: tarifa normal. De 16 a 20 personas en total: se cobran $750 MXN por cada persona adicional (las que pasen de 15) POR NOCHE. Ponlo en la cotizacion como linea aparte (ej. 18 personas por 2 noches: 3 personas adicionales x $750 x 2 noches = $4,500) y SUMALO al total de la renta (asi el anticipo del 50% tambien lo incluye) y al campo total del RESERVA_JSON. 20 personas es el maximo que puedes cotizar y apartar. Si son 21 PERSONAS O MAS en total, O si es una FIESTA o EVENTO con mas de 20 asistentes (aunque solo 15 a 20 se vayan a hospedar), NO cotices ni apartes. PRIMERO, si ya te dio fechas, usa consultar_disponibilidad (si estan OCUPADAS dile con calidez que no hay disponibilidad y ofrece otras fechas, sin PASAR_A_HUMANO). Si las fechas estan libres o aun no las da: dile con calidez que para fiestas y grupos grandes el administrador de la villa le dara una atencion personalizada y que en breve le escribe por este chat, y agrega al FINAL, en su propia linea, PASAR_A_HUMANO (se avisa al administrador de inmediato).
 - Direccion: Boulevard Rodolfo Gaona 106, Campestre Amazcala
@@ -638,10 +667,16 @@ PAQUETES ADICIONALES (se cobran aparte de la renta; se suman al total de la rese
 PAQUETES POR COTIZAR (Musica en Vivo y DJ, Experiencia Chef Privada, y cualquiera sin precio): NO des precio ni rangos. Dile con calidez que le avisaras al administrador de la villa y el se pondra en contacto para darle una atencion mas personalizada y armarlo a su gusto. Anotalo en "paquetes" de la reserva con "(por cotizar)".
 COMO OFRECERLOS: no los listes todos de golpe. Si preguntan por paquetes, menciona los nombres en una linea y da el detalle solo del que les interese. Si el motivo del viaje encaja (cumpleanos, ninos, descanso, festejo), sugiere uno de forma natural, sin presionar, una sola vez. Para los "por cotizar" pide los datos que se necesitan (fecha, duracion, numero de personas, preferencias) y di que en breve les compartes la cotizacion; nunca inventes una cifra. Si agregan un paquete con precio, sumalo en la cotizacion como renglon aparte y recalcula el anticipo del 50% sobre el total.
 
-TARIFAS POR NOCHE (cada noche se cobra segun el dia en que se duerme):
+TARIFAS POR NOCHE (cada noche se cobra segun el dia en que se duerme y segun la FECHA de esa noche):
+Noches hasta el 31 de diciembre de 2026:
 - Lunes a jueves y domingo: $10,500
 - Viernes: $12,000
 - Sabado: $14,000
+Noches a partir del 1 de enero de 2027 (precios nuevos):
+- Lunes a jueves y domingo: $11,500
+- Viernes: $13,000
+- Sabado: $15,000
+Si una estancia cruza el cambio (ej. 31 dic al 2 ene), la noche del 31 de diciembre va con precio 2026 y las de enero con precio 2027. NUNCA menciones que hay un aumento, precios anteriores ni que los precios cambian: solo cotiza con el precio que corresponde a cada noche. Si preguntan precios en general sin fechas, da los precios vigentes de hoy sin comentar nada del cambio. Si el cliente pregunta por que una fecha de 2027 sale mas cara, dile con naturalidad que es la tarifa de esas fechas.
 - Persona adicional (de la 16 a la 20, contando ninos): $750 por persona por noche
 Noches = dias entre llegada y salida (llegar martes y salir miercoles = 1 noche, la del martes).
 
@@ -695,7 +730,7 @@ ESCASEZ REAL: si el cliente pide viernes o sabado y fechas_libres muestra que en
 
 CONFIANZA: antes de pagar, el cliente quiere saber que la villa existe y es como en las fotos. Si pregunta la ubicacion, si duda en transferir o al mandar los datos bancarios, comparte el link de Google Maps (https://www.google.com/maps?q=20.6901757,-100.2620513)${process.env.LINK_VIDEO ? `, el video del recorrido (${process.env.LINK_VIDEO})` : ""}${process.env.LINK_RESENAS ? ` y las reseñas de otros huespedes (${process.env.LINK_RESENAS})` : ""}, y recuerdale que solo aparta con el 50% y que el deposito se entrega hasta la llegada. Nunca inventes links ni reseñas.
 
-ENTRE SEMANA: si el cliente tiene flexibilidad de fechas o pregunta por algo mas economico, comentale que de domingo a jueves la noche esta en $10,500. No ofrezcas extras, regalos ni beneficios adicionales por reservar entre semana.
+ENTRE SEMANA: si el cliente tiene flexibilidad de fechas o pregunta por algo mas economico, comentale que de domingo a jueves la noche esta en $10,500 (si sus fechas son de 2027, $11,500; no menciones el otro precio). No ofrezcas extras, regalos ni beneficios adicionales por reservar entre semana.
 
 CUANDO el cliente confirme que quiere reservar (y ya consultaste disponibilidad y esta libre), agrega al FINAL de tu respuesta, en su propia linea, exactamente esto (el cliente no lo vera):
 RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"...","paquetes":"...","total":N}
@@ -717,7 +752,9 @@ AVISO DE PAGO: si el cliente dice que ya deposito, ya pago, ya transfirio, o man
 
 CALENDARIO DE DISPONIBILIDAD: si el cliente pide el calendario, que fechas o dias tienen libres/disponibles en un mes, o no sabe que fecha elegir, dile en una frase que le mandas el calendario del mes con los dias libres y agrega al FINAL, en su propia linea, CALENDARIO:AAAA-MM (ej. CALENDARIO:2026-12). Si no dice mes, usa el mes actual; si pide dos meses, pon dos lineas (maximo 2). El sistema genera y envia la imagen. NO enlistes los dias libres en texto.
 
-FOTOS: ENVIAR_FOTOS es SOLO para fotos de la casa. Si piden fotos de pinatas, inflables o del paquete de fiesta, usa FOTOS_PINATAS y NUNCA ENVIAR_FOTOS. Si el cliente pide fotos de la casa, imagenes, ver la casa, las habitaciones o la alberca, responde con calidez algo breve como "¡Claro! Te comparto algunas fotos de la villa 📸" y agrega al FINAL de tu respuesta, en su propia linea, exactamente: ENVIAR_FOTOS (el cliente no lo vera). Las fotos se envian automaticamente; no digas que no puedes mandar fotos.
+FOTOS ESPECIFICAS: si el cliente pide fotos de algo en particular (un baño, una recamara especifica, la cocina, el asador, las camas, la alberca de noche, un detalle, un video, etc.), NO uses ENVIAR_FOTOS (esas son siempre las mismas fotos generales). Responde con calidez algo como "¡Claro! Le pido al administrador que te comparta fotos de eso en especifico y en breve te las manda por aqui 😊" y agrega al FINAL de tu respuesta, en su propia linea, exactamente: FOTOS_ESPECIFICAS: <lo que pidio, en pocas palabras>. Sigue atendiendo normal la conversacion. Usa ENVIAR_FOTOS solo cuando pida fotos generales de la villa ("mandame fotos", "como es la casa").
+
+FOTOS: ENVIAR_FOTOS es SOLO para fotos generales de la casa. Si piden fotos de pinatas, inflables o del paquete de fiesta, usa FOTOS_PINATAS y NUNCA ENVIAR_FOTOS. Si el cliente pide fotos de la casa, imagenes, ver la casa, las habitaciones o la alberca, responde con calidez algo breve como "¡Claro! Te comparto algunas fotos de la villa 📸" y agrega al FINAL de tu respuesta, en su propia linea, exactamente: ENVIAR_FOTOS (el cliente no lo vera). Las fotos se envian automaticamente; no digas que no puedes mandar fotos.
 
 CONTRATO E INE: NO hables del contrato ni pidas INE durante la cotizacion ni al apartar, y NUNCA mandes link de contrato. El contrato lo llena el administrador de la villa junto con el huesped a su llegada, en formato digital (toma 2 minutos) y se requiere la INE. Mencionalo solo al confirmar el pago ([SISTEMA] PAGO_CONFIRMADO). Si antes preguntan por el contrato, explica exactamente eso.
 
@@ -742,7 +779,7 @@ async function responderConClaude(history, contacto) {
   const ultimoCliente = [...history].reverse().find(m => m.role === "user" && typeof m.content === "string");
   const traeFechas = ultimoCliente && !String(ultimoCliente.content).startsWith("[SISTEMA]") && RE_FECHA_CLIENTE.test(String(ultimoCliente.content));
   const consultadas = new Map(); // "llegada|salida" -> disponible
-  let forzado = false;
+  let forzado = false, usoCalendario = false, forzadoSalida = false;
   for (let i = 0; i < 5; i++) {
     const params = { model: "claude-sonnet-5", max_tokens: 900, thinking: { type: "disabled" }, system: systemPrompt(), tools: TOOLS, messages: msgs };
     // El cliente escribio fechas: la primera accion obligatoria es consultar el calendario
@@ -768,6 +805,38 @@ async function responderConClaude(history, contacto) {
           }
         } catch (e) { console.error("Verificacion de cotizacion:", e.message); }
       }
+      // Red de seguridad 3: el cliente dio fecha y Vero quiere preguntar la salida/noches sin haber revisado el calendario
+      if (traeFechas && !usoCalendario && !forzadoSalida && /salida|cu[aá]ntas noches|hasta qu[eé] d[ií]a|qu[eé] d[ií]a (te )?(sales|saldr)|check.?out|how many nights|check.?out date/i.test(texto)) {
+        forzadoSalida = true;
+        console.log("Vero iba a preguntar la salida sin revisar el calendario - se fuerza la consulta");
+        msgs.push({ role: "assistant", content: [{ type: "text", text: texto }] });
+        msgs.push({ role: "user", content: "[SISTEMA] NO ENVIES ESE MENSAJE: antes de preguntar la salida o cuantas noches, revisa el calendario. Usa consultar_disponibilidad con la fecha que dio el cliente como llegada y el dia siguiente como salida. Si esta ocupada, dile que ya esta reservada y propone 2 alternativas libres (fechas_libres) sin preguntar la salida. Si esta libre, dile que esta disponible y luego preguntale cuantas noches. No menciones este aviso." });
+        continue;
+      }
+      // Red de seguridad 2: si menciona un festivo (Navidad, Año Nuevo, puentes...), se revisa el calendario de esas noches antes de enviar
+      if (!forzado && texto) {
+        try {
+          const hoyISO = new Date(Date.now() - 6 * 3600000).toISOString().slice(0, 10), ocupados = [];
+          const norm = t => t.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+          const txt = norm(texto);
+          const vistos = new Set();
+          for (const f of FESTIVOS) {
+            const clave = norm(f.nombre).replace(/^puente (de la |del |de )?/, "");
+            if (vistos.has(f.nombre) || !txt.includes(clave) || f.noches[f.noches.length - 1] < hoyISO) continue;
+            vistos.add(f.nombre);
+            const fmt = iso => iso.slice(8, 10) + "/" + iso.slice(5, 7) + "/" + iso.slice(0, 4);
+            const libre = (await consultarUnaVez(fmt(f.noches[0]), fmt(sigDia(f.noches[f.noches.length - 1])))).disponible;
+            if (!libre) ocupados.push(f.nombre);
+          }
+          if (ocupados.length) {
+            forzado = true;
+            console.log("Vero menciono festivos ocupados:", ocupados.join(", "), "- se reescribe");
+            msgs.push({ role: "assistant", content: [{ type: "text", text: texto }] });
+            msgs.push({ role: "user", content: `[SISTEMA] NO ENVIES ESE MENSAJE: revise el calendario y ${ocupados.join(" y ")} ya tiene noches RESERVADAS. Escribe de nuevo tu respuesta sin ofrecer ni mencionar ${ocupados.join(" ni ")} como disponible. Si el cliente pregunto por esas fechas, dile con calidez que ya estan reservadas y propone fechas libres (usa fechas_libres). No menciones este aviso.` });
+            continue;
+          }
+        } catch (e) { console.error("Verificacion de festivos:", e.message); }
+      }
       return texto;
     }
     msgs.push({ role: "assistant", content: response.content });
@@ -781,12 +850,18 @@ async function responderConClaude(history, contacto) {
           out = { reservas: lista, nota: lista.length ? "Estas son sus unicas reservas vigentes" : "No tiene reservas vigentes (si hablaron de una antes, fue cancelada)" };
           console.log("Reservas de", contacto, ":", lista.length);
         } else if (b.name === "fechas_libres") {
+          usoCalendario = true;
           out = await fechasLibres(b.input.mes);
           console.log("Fechas libres", b.input.mes, ":", out.viernes_libres, "viernes /", out.sabados_libres, "sabados");
         } else {
+          usoCalendario = true;
           out = await consultarDisponibilidad(b.input.llegada, b.input.salida);
           try { consultadas.set(aISO(b.input.llegada) + "|" + aISO(b.input.salida), out.disponible); } catch (e) {}
           if (!out.disponible) out.instruccion = "OCUPADO: dile al cliente ahora mismo que esas fechas ya estan reservadas. No preguntes cuantas personas son ni des precios para estas fechas. Usa fechas_libres y propone las 2 alternativas mas cercanas.";
+          else {
+            const fest = festivoConMinimo(b.input.llegada, b.input.salida);
+            if (fest) { out.minimo_2_noches = fest; out.instruccion = `FESTIVO (${fest}): la fecha toca un dia festivo/puente. Dile amablemente que por alta demanda en esas fechas se reservan minimo 2 noches, y proponle la estancia de 2 noches mas cercana (llegar un dia antes o salir un dia despues). No cotices 1 sola noche; revisa disponibilidad de la opcion de 2 noches antes de cotizarla.`; }
+          }
           console.log("Disponibilidad", b.input.llegada, "-", b.input.salida, out.disponible ? "LIBRE" : "OCUPADO");
         }
       } catch (e) {
@@ -861,7 +936,9 @@ app.post("/webhook", async (req, res) => {
   // PAUSA AUTOMATICA: cuando el administrador escribe a mano (WhatsApp o chat en vivo), ManyChat vuelve a mandar
   // el ultimo mensaje del cliente. Si llega repetido y Vero ya lo habia contestado, es el administrador: Vero se pausa.
   const msgN = String(message).trim(), ult = ultimoCliente.get(String(phoneNumber));
-  if (ult && ult.texto === msgN && !msgN.startsWith("[") && Date.now() - ult.t > ECO_MIN_MS && Date.now() - ult.t < 48 * 3600000 && !pendientes.has(phoneNumber) && !procesando.has(phoneNumber)) {
+  // Mensajes cortos ("hola", "?", "si", "gracias") los repite el propio cliente cuando siente que no le contestan: nunca pausan
+  const msgCorto = msgN.split(/\s+/).length <= 4 || esSaludo(msgN) || /^[\W\d]*$/.test(msgN);
+  if (ult && ult.texto === msgN && !msgCorto && !msgN.startsWith("[") && Date.now() - ult.t > ECO_MIN_MS && Date.now() - ult.t < 48 * 3600000 && !pendientes.has(phoneNumber) && !procesando.has(phoneNumber)) {
     pausarPorAdmin(phoneNumber, "el administrador escribio al cliente");
     return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
   }
@@ -890,7 +967,8 @@ app.post("/webhook", async (req, res) => {
     console.log("Procesando", p.textos.length, "mensaje(s) de", phoneNumber);
     Promise.resolve(procesarMensaje(phoneNumber, telefono, p.textos.join("\n"), p.res))
       .catch(e => console.error("Error procesando:", e.message))
-      .finally(() => { procesando.delete(phoneNumber); ultimoCliente.set(String(phoneNumber), { texto: String(p.textos[p.textos.length - 1]).trim(), t: Date.now() }); });
+      .finally(() => { procesando.delete(phoneNumber); });
+    textoEnCurso.set(String(phoneNumber), String(p.textos[p.textos.length - 1]).trim());
   };
   p.timer = setTimeout(lanzar, espera);
   pendientes.set(phoneNumber, p);
@@ -899,6 +977,7 @@ app.post("/webhook", async (req, res) => {
 const ESPERA_MS = Number(process.env.ESPERA_MS || 3000);
 const ESPERA_SALUDO_MS = Number(process.env.ESPERA_SALUDO_MS || 25000);
 const cancelados = new Set();
+const textoEnCurso = new Map();
 const ultimoCliente = new Map(); // contacto -> ultimo mensaje del cliente ya contestado (para detectar al administrador)
 const ECO_MIN_MS = Number(process.env.ECO_MIN_MS || 5000);
 function pausarPorAdmin(id, motivo) {
@@ -907,6 +986,7 @@ function pausarPorAdmin(id, motivo) {
   const p = pendientes.get(id); if (p && p.timer) clearTimeout(p.timer);
   pendientes.delete(id); planGrupo.delete(id); grupoGrande.delete(id); ultimoCliente.delete(String(id));
   console.log("PAUSA AUTOMATICA:", motivo, "-", id, "- Vero en pausa", horas, "h");
+  if (motivo !== "pausa manual") avisarAdmins({ id, texto: `⏸️ Vero se pausó ${horas} h con este cliente porque detectó que le escribiste tú. Si no fuiste tú, reactívala aquí: ${URL_PUBLICA}/continuar/${id}` }).catch(() => {});
 }
 const pensando = new Set(); // mientras Claude prepara la respuesta de ese contacto
 const esSaludo = m => /^[\s\W]*((hola|holi|holaa+|buen[oa]s?|d[ií]as|tardes|noches|qu[eé] tal|que onda|info|informaci[oó]n|hey|hi|hello|saludos)[\s\W]*)+$/i.test(String(m).trim());
@@ -989,7 +1069,7 @@ function continuarContacto(id, nota) {
         try {
           const history = row ? JSON.parse(row.messages) : [];
           let reply = await responderConClaude(history, id);
-          reply = String(reply).replace(/COTIZACION_JSON:\{.*?\}|NO_INTERESADO|PASAR_A_HUMANO|FOTOS_CASA|FOTOS_PINATAS|RESERVA_JSON[\s\S]*$/g, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim();
+          reply = String(reply).replace(/COTIZACION_JSON:\{.*?\}|NO_INTERESADO|PASAR_A_HUMANO|FOTOS_ESPECIFICAS:[^\n]*|FOTOS_CASA|FOTOS_PINATAS|RESERVA_JSON[\s\S]*$/g, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim();
           if (!reply) return resolve("sin respuesta");
           history.push({ role: "assistant", content: reply });
           while (history.length > 40) history.shift();
@@ -1281,6 +1361,13 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         await bitacora("Pide hablar con persona", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber }).catch(() => {});
         avisarAdmins({ id: phoneNumber, telefono, texto: motivoAviso }).then(out => console.log("Resultado aviso:", out.join(" | "))).catch(e => console.error("Aviso admin:", e.message));
       }
+      const mFotos = mensajeCliente.match(/FOTOS_ESPECIFICAS:\s*([^\n]*)/);
+      if (mFotos) {
+        mensajeCliente = mensajeCliente.replace(/FOTOS_ESPECIFICAS:[^\n]*/g, "").trim();
+        enviarFotos = "no";
+        console.log("FOTOS ESPECIFICAS solicitadas por", phoneNumber, "-", mFotos[1]);
+        avisarAdmins({ id: phoneNumber, telefono, texto: `📸 PIDE FOTOS ESPECIFICAS: ${mFotos[1] || message}\nMensaje: ${message}` }).catch(e => console.error("Aviso admin:", e.message));
+      }
       let fotosPinatas = "no";
       if (mensajeCliente.includes("FOTOS_PINATAS")) {
         fotosPinatas = "si";
@@ -1298,11 +1385,19 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         [phoneNumber, JSON.stringify(history)]);
 
       clearTimeout(timer);
+      if (!String(mensajeCliente).trim() && enviarFotos === "no" && fotosPinatas === "no" && avisoHumano === "no") {
+        console.error("RESPUESTA VACIA para", phoneNumber, "- se manda respuesta de respaldo");
+        mensajeCliente = "Perdón, ¿me lo repites por favor? Quiero asegurarme de ayudarte bien 😊";
+      }
+      if (textoEnCurso.has(String(phoneNumber))) ultimoCliente.set(String(phoneNumber), { texto: textoEnCurso.get(String(phoneNumber)), t: Date.now() });
       if (enviado) enviarPorManyChat(phoneNumber, mensajeCliente);
       else res.json({ response: mensajeCliente, avisoPago, enviarFotos, fotosPinatas, avisoHumano });
     } catch (error) {
       console.error(error);
-      if (!res.headersSent) res.status(200).json({ response: "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?" });
+      pensando.delete(phoneNumber);
+      const disculpa = "Perdón, tuve un pequeño problema técnico 🙏 ¿Me repites tu último mensaje?";
+      if (!res.headersSent) res.status(200).json({ response: disculpa });
+      else enviarPorManyChat(phoneNumber, disculpa);
     }
   });
 }
@@ -1557,7 +1652,7 @@ async function analizarConClaude(convs) {
   const texto = abiertas.map(c => `### ID ${c.id} | etapa: ${ETAPAS[c.etapa]} | ultimo mensaje de: ${c.sinRespuesta ? "CLIENTE (Vero no contesto)" : "Vero"} | hace ${Math.round(c.horas)} h\n` + c.msgs.slice(-14).map(m => `${m.r === "user" ? "C" : "V"}: ${m.t.slice(0, 280)}`).join("\n")).join("\n\n");
   const r = await client.messages.create({
     model: "claude-sonnet-5", max_tokens: 8000, thinking: { type: "disabled" },
-    system: "Eres el analista comercial de Villa de Canto (casa de descanso en Amazcala, Queretaro, para hasta 20 personas; tarifas $10,500 dom-jue, $12,000 viernes, $14,000 sabado; para apartar 50% de anticipo; el deposito en garantia de $5,000 se entrega a la llegada). Vero es la asistente de IA que atiende WhatsApp. Revisa conversaciones que NO terminaron en reserva y explica con honestidad por que se cayeron (precio, fechas ocupadas, Vero contesto mal o lento, Vero no contesto, falta de seguimiento, cliente solo cotizaba, etc.). Responde SOLO un JSON valido, sin texto extra, con esta forma: {\"resumen\":\"2-3 frases\",\"causas\":[{\"causa\":\"\",\"cuantas\":0,\"solucion\":\"\"}],\"cambios_vero\":[\"cambio concreto a las instrucciones de Vero\"],\"conversaciones\":[{\"id\":\"\",\"motivo\":\"1 frase\",\"accion\":\"que debe hacer el administrador\",\"mensaje\":\"mensaje corto y calido para reenganchar por WhatsApp, o vacio si no conviene\"}]}. Maximo 6 causas y 6 cambios, ordenados por impacto.",
+    system: "Eres el analista comercial de Villa de Canto (casa de descanso en Amazcala, Queretaro, para hasta 20 personas; tarifas $10,500 dom-jue, $12,000 viernes, $14,000 sabado (desde el 1 ene 2027: $11,500, $13,000 y $15,000); para apartar 50% de anticipo; el deposito en garantia de $5,000 se entrega a la llegada). Vero es la asistente de IA que atiende WhatsApp. Revisa conversaciones que NO terminaron en reserva y explica con honestidad por que se cayeron (precio, fechas ocupadas, Vero contesto mal o lento, Vero no contesto, falta de seguimiento, cliente solo cotizaba, etc.). Responde SOLO un JSON valido, sin texto extra, con esta forma: {\"resumen\":\"2-3 frases\",\"causas\":[{\"causa\":\"\",\"cuantas\":0,\"solucion\":\"\"}],\"cambios_vero\":[\"cambio concreto a las instrucciones de Vero\"],\"conversaciones\":[{\"id\":\"\",\"motivo\":\"1 frase\",\"accion\":\"que debe hacer el administrador\",\"mensaje\":\"mensaje corto y calido para reenganchar por WhatsApp, o vacio si no conviene\"}]}. Maximo 6 causas y 6 cambios, ordenados por impacto.",
     messages: [{ role: "user", content: `Hoy es ${hoyMexico()}. Conversaciones abiertas:\n\n${texto}` }],
   });
   const raw = r.content.filter(b => b.type === "text").map(b => b.text).join("");
