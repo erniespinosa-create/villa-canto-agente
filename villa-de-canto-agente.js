@@ -131,8 +131,32 @@ async function consultarDisponibilidad(llegada, salida) {
   return { disponible };
 }
 
+function leerReservaJSON(txt) {
+  const m = String(txt).match(/RESERVA_JSON\s*:?\s*(?:```(?:json)?)?\s*(\{[\s\S]*?\})\s*(?:```)?/);
+  if (!m) return null;
+  let raw = m[1].replace(/:\s*\$?\s*(\d{1,3}(?:,\d{3})+)(\.\d+)?/g, (_, n, d) => ":" + n.replace(/,/g, "") + (d || ""));
+  let datos;
+  try { datos = JSON.parse(raw); } catch (e) { return { bloque: m[0], error: "JSON invalido: " + e.message }; }
+  for (const k of ["llegada", "salida"]) datos[k] = String(datos[k] || "").trim().replace(/-/g, "/");
+  const val = v => /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(v);
+  if (!val(datos.llegada) || !val(datos.salida)) return { bloque: m[0], error: "Fechas invalidas: " + datos.llegada + " - " + datos.salida };
+  // Si la fecha quedo en el pasado (ej. 03/01/2026 cuando el cliente quiso enero 2027), se pasa al año siguiente
+  const hoy = new Date(Date.now() - MX).toISOString().slice(0, 10);
+  if (aISO(datos.llegada) < hoy) {
+    const mas1 = f => { const [d, mm, a] = f.split("/"); return `${d}/${mm}/${Number(a) + 1}`; };
+    datos.llegada = mas1(datos.llegada);
+    if (aISO(datos.salida) <= aISO(datos.llegada)) datos.salida = mas1(datos.salida);
+    console.log("Año corregido en reserva:", datos.llegada, "-", datos.salida);
+  }
+  if (aISO(datos.salida) <= aISO(datos.llegada)) return { bloque: m[0], error: "La salida no es despues de la llegada" };
+  return { bloque: m[0], datos };
+}
 async function crearEventoCalendar(datos) {
   if (Number(datos.adultos || 0) + Number(datos.ninos || 0) > 20) return { excedido: true };
+  // Si ya existe un evento de ESTE mismo cliente en esas fechas, no se duplica ni se le dice "ocupado"
+  const previo = await consultarUnaVez(datos.llegada, datos.salida);
+  const propio = previo.eventos.find(e => String(e.extendedProperties?.private?.contacto || "") === String(datos.contacto || "") && datos.contacto);
+  if (propio && previo.eventos.length === 1) return { ocupado: false, id: propio.id, existente: true };
   const { disponible } = await consultarDisponibilidad(datos.llegada, datos.salida);
   if (!disponible) return { ocupado: true };
   cacheCal.clear(); // la imagen del calendario se regenera con la nueva reserva
@@ -157,6 +181,43 @@ async function crearEventoCalendar(datos) {
   return { ocupado: false, id: evento.data.id };
 }
 
+const ultimoAseguro = new Map();
+async function asegurarApartado(id, telefono, motivo) {
+  if (!id || Date.now() - (ultimoAseguro.get(id) || 0) < 10 * 60000) return;
+  ultimoAseguro.set(id, Date.now());
+  try {
+    const ev = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: [`contacto=${id}`], timeMin: new Date().toISOString(), singleEvents: true });
+    if ((ev.data.items || []).some(e => e.status !== "cancelled")) return;
+    const hoy = new Date(Date.now() - MX).toISOString().slice(0, 10);
+    let datos = null;
+    const ult = await dbGet("SELECT datos FROM reservas_ult WHERE id = ?", [id]);
+    if (ult) { const d = JSON.parse(ult.datos); if (aISO(d.llegada) >= hoy) datos = d; }
+    if (!datos) {
+      const cq = await dbGet("SELECT llegada, salida, total FROM cotizaciones WHERE id = ?", [id]);
+      if (cq && aISO(cq.llegada) >= hoy) {
+        const info = await infoContacto(id).catch(() => ({}));
+        datos = { nombre: info.nombre || info.name || "Cliente " + id, llegada: cq.llegada, salida: cq.salida, adultos: "?", ninos: 0, motivo: "-", paquetes: "Revisar conversacion", total: cq.total || 0 };
+      }
+    }
+    const tel = (telefono && !String(telefono).includes("{{")) ? telefono : id;
+    if (!datos) {
+      console.log("SIN APARTADO y sin cotizacion para", id, "-", motivo);
+      return avisarAdmins({ id, telefono, texto: `⚠️ ${motivo}, pero no hay reserva en el calendario ni cotización guardada. Agéndala a mano.` });
+    }
+    datos.contacto = id; datos.telefono = tel;
+    // Si el admin ya lo agendo a mano (su ID o telefono aparece en el evento), no se duplica ni se avisa
+    const yaEsta = (await consultarUnaVez(datos.llegada, datos.salida)).eventos.some(e => { const s = (e.summary || "") + " " + (e.description || ""), tel10 = String(tel).replace(/\D/g, "").slice(-10); return s.includes(String(id)) || (tel10.length === 10 && s.replace(/\D/g, "").includes(tel10)); });
+    if (yaEsta) return;
+    const r = await crearEventoCalendar(datos);
+    if (r.id) {
+      console.log("APARTADO AUTOMATICO (" + motivo + "):", id, datos.llegada, "-", datos.salida, r.id);
+      db.run("INSERT OR REPLACE INTO reservas_ult (id, datos, evento, creado) VALUES (?, ?, ?, ?)", [id, JSON.stringify(datos), r.id, Date.now()]);
+      await bitacora("Pendiente de pago (automatico)", { ...datos, eventoId: r.id });
+    } else {
+      avisarAdmins({ id, telefono, texto: `⚠️ ${motivo}, pero ${datos.llegada} al ${datos.salida} ya está ocupado en el calendario. Revísalo.` }).catch(() => {});
+    }
+  } catch (e) { console.error("asegurarApartado:", e.message); }
+}
 async function confirmarReservas(contacto) {
   const r = await calendar.events.list({
     calendarId: CALENDAR_ID,
@@ -501,6 +562,7 @@ db.run("CREATE TABLE IF NOT EXISTS seguimiento (id TEXT PRIMARY KEY, enviado_par
 db.run("CREATE TABLE IF NOT EXISTS pausas (id TEXT PRIMARY KEY, hasta INTEGER)");
 db.run("CREATE TABLE IF NOT EXISTS cotizaciones (id TEXT PRIMARY KEY, llegada TEXT, salida TEXT, total REAL, creado INTEGER, recordatorio TEXT)");
 db.run("CREATE TABLE IF NOT EXISTS no_recordar (id TEXT PRIMARY KEY)");
+db.run("CREATE TABLE IF NOT EXISTS reservas_ult (id TEXT PRIMARY KEY, datos TEXT, evento TEXT, creado INTEGER)");
 db.run("ALTER TABLE cotizaciones ADD COLUMN enviado_en INTEGER", () => {});
 db.run("ALTER TABLE cotizaciones ADD COLUMN ultimo_cliente INTEGER", () => {});
 db.run("CREATE TABLE IF NOT EXISTS campanas (flow TEXT, id TEXT, enviado INTEGER, PRIMARY KEY (flow, id))");
@@ -528,7 +590,7 @@ FORMATO DE FECHAS: El cliente puede escribir fechas de cualquier forma (22/09/20
 
 NUNCA INVENTES DATOS: usa solo lo que el cliente escribio literalmente. Si dice "2 adultos" y no menciona ninos, pregunta "¿van ninos?" o asume 0; jamas agregues personas, fechas o motivos que no dijo.
 
-DISPONIBILIDAD: en cuanto tengas fecha de llegada y de salida, usa la herramienta consultar_disponibilidad ANTES de cotizar. Si no esta disponible, dilo con calidez y ofrece buscar otras fechas. Nunca digas que hay disponibilidad sin haberla consultado.
+DISPONIBILIDAD PRIMERO (REGLA NUMERO 1): en cuanto el cliente mencione CUALQUIER fecha (un dia, "del 3 al 5", "el sabado", "fin de semana", "2 noches", "mañana"), lo PRIMERO que haces es usar consultar_disponibilidad, ANTES de preguntar nombre, adultos, ninos, motivo o de dar precios. Si solo te dio la llegada, consulta esa noche (salida = dia siguiente) y si dijo cuantas noches, usa esas noches. Si esta OCUPADO: dilo de inmediato en tu respuesta, NO preguntes cuantas personas son ni des precios para esas fechas; usa fechas_libres y propone las 2 alternativas mas cercanas. Solo si esta LIBRE sigues con las preguntas para cotizar. Si el cliente cambia de fechas, vuelve a consultar. Nunca digas que hay disponibilidad sin haberla consultado en este momento (lo que se dijo antes en la conversacion puede haber cambiado).
 
 DATOS:
 - Capacidad y personas adicionales: se cuentan TODAS las personas (adultos + ninos). Hasta 15 personas en total: tarifa normal. De 16 a 20 personas en total: se cobran $750 MXN por cada persona adicional (las que pasen de 15) POR NOCHE. Ponlo en la cotizacion como linea aparte (ej. 18 personas por 2 noches: 3 personas adicionales x $750 x 2 noches = $4,500) y SUMALO al total de la renta (asi el anticipo del 50% tambien lo incluye) y al campo total del RESERVA_JSON. 20 personas es el maximo que puedes cotizar y apartar. Si son 21 PERSONAS O MAS en total, O si es una FIESTA o EVENTO con mas de 20 asistentes (aunque solo 15 a 20 se vayan a hospedar), NO cotices ni apartes. PRIMERO, si ya te dio fechas, usa consultar_disponibilidad (si estan OCUPADAS dile con calidez que no hay disponibilidad y ofrece otras fechas, sin PASAR_A_HUMANO). Si las fechas estan libres o aun no las da: dile con calidez que para fiestas y grupos grandes el administrador de la villa le dara una atencion personalizada y que en breve le escribe por este chat, y agrega al FINAL, en su propia linea, PASAR_A_HUMANO (se avisa al administrador de inmediato).
@@ -605,7 +667,7 @@ LONGITUD: estas en WhatsApp. Responde CORTO, maximo 4-6 lineas por mensaje, como
 
 EXTRACCION DE DATOS: el cliente puede darte varios datos en un solo mensaje o uno por uno. Lee todo el mensaje y extrae nombre, fechas, adultos, ninos y motivo sin importar el orden o formato. Nunca vuelvas a pedir un dato que ya te dio. SIEMPRE responde algo a cada mensaje.
 
-FLUJO: saluda, pregunta que necesita, recoge nombre/fechas/adultos/ninos/motivo de forma natural, consulta disponibilidad, calcula noches y total, presenta cotizacion (con precio por persona y el deposito en garantia a la llegada) y cierra con una pregunta para apartar; si acepta manda datos bancarios con el monto a transferir (solo el anticipo del 50%) y pide que envie la foto de su comprobante por este chat y que despues escriba "listo" para avisarte. Si el cliente escribe "listo" (o similar) despues de los datos bancarios, tomalo como aviso de pago.
+FLUJO: saluda, pregunta que necesita; en cuanto haya fechas CONSULTA DISPONIBILIDAD (antes de cualquier otra pregunta); si esta libre, recoge nombre/adultos/ninos/motivo de forma natural, calcula noches y total, presenta cotizacion (con precio por persona y el deposito en garantia a la llegada) y cierra con una pregunta para apartar; si acepta manda datos bancarios con el monto a transferir (solo el anticipo del 50%) y pide que envie la foto de su comprobante por este chat y que despues escriba "listo" para avisarte. Si el cliente escribe "listo" (o similar) despues de los datos bancarios, tomalo como aviso de pago.
 
 NO SEAS INSISTENTE, PERO SI CIERRA: si el cliente solo esta preguntando cosas generales (fotos, servicios, ubicacion, habitaciones, precios en general, paquetes, horarios) sin fechas, responde su pregunta y ya; no termines cada mensaje preguntando por fechas. Si el cliente ya dijo que solo esta viendo o que despues te avisa, no vuelvas a ofrecer reservar a menos que el lo pida. Deja que el cliente lleve el ritmo, como lo haria un buen anfitrion.
 
@@ -619,10 +681,11 @@ ESCASEZ REAL: si el cliente pide viernes o sabado y fechas_libres muestra que en
 
 CONFIANZA: antes de pagar, el cliente quiere saber que la villa existe y es como en las fotos. Si pregunta la ubicacion, si duda en transferir o al mandar los datos bancarios, comparte el link de Google Maps (https://www.google.com/maps?q=20.6901757,-100.2620513)${process.env.LINK_VIDEO ? `, el video del recorrido (${process.env.LINK_VIDEO})` : ""}${process.env.LINK_RESENAS ? ` y las reseñas de otros huespedes (${process.env.LINK_RESENAS})` : ""}, y recuerdale que solo aparta con el 50% y que el deposito se entrega hasta la llegada. Nunca inventes links ni reseñas.
 
-${process.env.EXTRA_ENTRE_SEMANA ? `ENTRE SEMANA: si el cliente tiene flexibilidad de fechas, pregunta por algo mas economico, o es posada, empresa o familia en vacaciones, comentale que de domingo a jueves la noche esta en $10,500 y que en esas estancias se incluye: ${process.env.EXTRA_ENTRE_SEMANA}. Solo aplica si TODAS las noches de la estancia son de domingo a jueves. No es descuento: no cambies tarifas.` : "ENTRE SEMANA: si el cliente tiene flexibilidad de fechas o pregunta por algo mas economico, comentale que de domingo a jueves la noche esta en $10,500."}
+ENTRE SEMANA: si el cliente tiene flexibilidad de fechas o pregunta por algo mas economico, comentale que de domingo a jueves la noche esta en $10,500. No ofrezcas extras, regalos ni beneficios adicionales por reservar entre semana.
 
 CUANDO el cliente confirme que quiere reservar (y ya consultaste disponibilidad y esta libre), agrega al FINAL de tu respuesta, en su propia linea, exactamente esto (el cliente no lo vera):
 RESERVA_JSON:{"nombre":"...","llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","adultos":N,"ninos":N,"motivo":"...","paquetes":"...","total":N}
+Todo en UNA sola linea, sin backticks. "total" es un numero sin comas ni signo de pesos (ej. 26000). El ANO debe ser el correcto segun FECHA DE HOY: si piden enero y hoy es noviembre o diciembre, es enero del ano SIGUIENTE. Agregalo tambien cuando el cliente diga que ya transfirio o mande comprobante y aun no lo habias agregado para esas fechas.
 En "paquetes" pon los paquetes que le interesaron al cliente separados por coma (ej. "Fiesta Infantil, Karaoke"; marca los por cotizar asi: "Chef Privada (por cotizar)"); si ninguno, pon "Ninguno".
 Solo UNA vez por cada reserva confirmada (no la repitas si solo estan platicando de la misma reserva).
 
@@ -659,19 +722,39 @@ Las distancias son aproximadas; dilas como "unos X minutos".`}
 MENSAJES DEL SISTEMA: si recibes un mensaje que empieza con [SISTEMA] PAGO_CONFIRMADO, no lo escribio el cliente: significa que el administrador ya verifico el pago del anticipo. Escribele al cliente con calidez que su pago fue recibido y su reserva esta confirmada (menciona en una frase que el dia de llegada se entrega el restante y el deposito en garantia de $5,000, que se le regresa completo dentro de las 48 h siguientes a su salida si todo esta en orden). Luego, en tono cercano (NO como lista de tareas ni "Para terminar"), dile que el administrador de la villa los recibira a su llegada y, para facilitarles todo, llenaran juntos el contrato digital en ese momento (toma solo 2 minutos); que por favor tengan a la mano su INE, ya que se requiere para el contrato. NO mandes ningun link de contrato y NO pidas la INE por este chat. Despues dale los datos de llegada: direccion, link de ubicacion en Google Maps (https://www.google.com/maps?q=20.6901757,-100.2620513), check-in 13:00, check-out 12:00, y el numero del administrador de la villa (442 874 2383): con el se verifica cualquier persona extra o cambio de horario de entrada o salida. Nunca menciones la palabra SISTEMA.`;
 }
 
+const RE_FECHA_CLIENTE = /\b\d{1,2}\s*(de\s+)?(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)|\b\d{1,2}\s*[\/\-]\s*\d{1,2}\b|\bdel?\s+\d{1,2}\s+al?\s+\d{1,2}\b|\b(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\b|fin(es)? de semana|\bpuente\b|\bma[nñ]ana\b|\b\d+\s*noches?\b|\b(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\b|\b(january|february|march|april|june|july|august|september|october|november|december|weekend|friday|saturday)\b/i;
 async function responderConClaude(history, contacto) {
   const msgs = history.map(m => ({ role: m.role, content: m.content }));
-  for (let i = 0; i < 4; i++) {
-    const response = await client.messages.create({
-      model: "claude-sonnet-5",
-      max_tokens: 900,
-      thinking: { type: "disabled" },
-      system: systemPrompt(),
-      tools: TOOLS,
-      messages: msgs,
-    });
+  const ultimoCliente = [...history].reverse().find(m => m.role === "user" && typeof m.content === "string");
+  const traeFechas = ultimoCliente && !String(ultimoCliente.content).startsWith("[SISTEMA]") && RE_FECHA_CLIENTE.test(String(ultimoCliente.content));
+  const consultadas = new Map(); // "llegada|salida" -> disponible
+  let forzado = false;
+  for (let i = 0; i < 5; i++) {
+    const params = { model: "claude-sonnet-5", max_tokens: 900, thinking: { type: "disabled" }, system: systemPrompt(), tools: TOOLS, messages: msgs };
+    // El cliente escribio fechas: la primera accion obligatoria es consultar el calendario
+    if (i === 0 && traeFechas) params.tool_choice = { type: "any" };
+    const response = await client.messages.create(params);
     if (response.stop_reason !== "tool_use") {
-      return response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+      const texto = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+      // Red de seguridad: si va a mandar una cotizacion para fechas que no consulto en este turno, se consultan antes de enviar
+      const cq = texto.match(/COTIZACION_JSON:(\{.*?\})/);
+      if (cq && !forzado) {
+        try {
+          const q = JSON.parse(cq[1]), ll = String(q.llegada || "").replace(/-/g, "/"), sa = String(q.salida || "").replace(/-/g, "/");
+          if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(ll) && /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(sa)) {
+            const k = aISO(ll) + "|" + aISO(sa);
+            let libre = consultadas.get(k);
+            if (libre === undefined) { libre = (await consultarDisponibilidad(ll, sa)).disponible; console.log("Verificacion antes de cotizar", ll, "-", sa, libre ? "LIBRE" : "OCUPADO"); }
+            if (!libre) {
+              forzado = true;
+              msgs.push({ role: "assistant", content: response.content.filter(b => b.type === "text").length ? response.content : [{ type: "text", text: texto || "." }] });
+              msgs.push({ role: "user", content: `[SISTEMA] NO ENVIES ESA COTIZACION: acabo de revisar el calendario y del ${ll} al ${sa} esta OCUPADO. Escribe de nuevo tu respuesta al cliente: dile con calidez que esas fechas ya estan reservadas, no des precios para ellas ni preguntes cuantas personas son, usa fechas_libres y propone las 2 alternativas libres mas cercanas. No menciones este aviso.` });
+              continue;
+            }
+          }
+        } catch (e) { console.error("Verificacion de cotizacion:", e.message); }
+      }
+      return texto;
     }
     msgs.push({ role: "assistant", content: response.content });
     const resultados = [];
@@ -688,6 +771,8 @@ async function responderConClaude(history, contacto) {
           console.log("Fechas libres", b.input.mes, ":", out.viernes_libres, "viernes /", out.sabados_libres, "sabados");
         } else {
           out = await consultarDisponibilidad(b.input.llegada, b.input.salida);
+          try { consultadas.set(aISO(b.input.llegada) + "|" + aISO(b.input.salida), out.disponible); } catch (e) {}
+          if (!out.disponible) out.instruccion = "OCUPADO: dile al cliente ahora mismo que esas fechas ya estan reservadas. No preguntes cuantas personas son ni des precios para estas fechas. Usa fechas_libres y propone las 2 alternativas mas cercanas.";
           console.log("Disponibilidad", b.input.llegada, "-", b.input.salida, out.disponible ? "LIBRE" : "OCUPADO");
         }
       } catch (e) {
@@ -939,6 +1024,9 @@ function procesarMensaje(phoneNumber, telefono, message, res) {
     }
     if (pausa && pausa.hasta > Date.now() && !String(message).startsWith("[SISTEMA]")) {
       console.log("Agente en pausa (lo atiende una persona):", phoneNumber);
+      if (/transfer|deposit|pagu[eé]|pagado|comprobante|anticipo|listo el pago|ya qued[oó]|\.(jpe?g|png|pdf)(\?|$)|fbsbx|lookaside/i.test(String(message))) {
+        asegurarApartado(phoneNumber, telefono, "El cliente avisó pago mientras lo atendía el administrador").catch(() => {});
+      }
       anotarHistorial(phoneNumber, "[Mensaje del cliente mientras lo atendia el administrador]: " + message);
       return res.json({ response: "", omitir: "si", avisoPago: "no", enviarFotos: "no", fotosPinatas: "no", avisoHumano: "no" });
     }
@@ -970,8 +1058,29 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
     try {
       if (String(message).startsWith("[SISTEMA] PAGO_CONFIRMADO")) {
         try {
-          const n = await confirmarReservas(phoneNumber);
-          if (n === 0) console.log("No habia reservas pendientes para", phoneNumber);
+          let n = await confirmarReservas(phoneNumber);
+          if (n === 0) {
+            let ult = await dbGet("SELECT datos FROM reservas_ult WHERE id = ?", [phoneNumber]);
+            if (!ult) {
+              // Sin RESERVA_JSON: se usa la ultima cotizacion guardada de este cliente
+              const cq = await dbGet("SELECT llegada, salida, total FROM cotizaciones WHERE id = ?", [phoneNumber]);
+              if (cq) {
+                const info = await infoContacto(phoneNumber).catch(() => ({}));
+                ult = { datos: JSON.stringify({ nombre: info.nombre || info.name || "Cliente " + phoneNumber, llegada: cq.llegada, salida: cq.salida, adultos: "?", ninos: 0, motivo: "-", paquetes: "Revisar conversacion", total: cq.total || 0, contacto: phoneNumber, telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber }) };
+                console.log("Reserva reconstruida desde la cotizacion:", cq.llegada, "-", cq.salida);
+              }
+            }
+            if (ult) {
+              const datos = JSON.parse(ult.datos);
+              const r = await crearEventoCalendar(datos);
+              if (r.id) { n = await confirmarReservas(phoneNumber); console.log("Reserva creada al confirmar pago:", r.id, datos.llegada, "-", datos.salida); db.run("UPDATE reservas_ult SET evento = ? WHERE id = ?", [r.id, phoneNumber]); }
+              else avisarAdmins({ id: phoneNumber, telefono, texto: `⚠️ Pago confirmado pero ${datos.llegada} al ${datos.salida} ya está ocupado en el calendario. Revísalo.` }).catch(() => {});
+            }
+            if (n === 0) {
+              console.log("No habia reservas pendientes para", phoneNumber);
+              avisarAdmins({ id: phoneNumber, telefono, texto: "⚠️ Confirmaste un pago pero no encontré la reserva de este cliente en el calendario. Agéndala a mano." }).catch(() => {});
+            }
+          }
         } catch (e) {
           console.error("Error confirmando reserva en Calendar:", e.message);
         }
@@ -1015,11 +1124,15 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
       }
       cancelados.delete(phoneNumber);
       let mensajeCliente = reply;
-      const match = reply.match(/RESERVA_JSON:(\{.*\})/);
-      if (match) {
-        mensajeCliente = reply.replace(match[0], "").trim();
+      const lr = leerReservaJSON(reply);
+      if (lr) mensajeCliente = reply.replace(lr.bloque, "").replace(/RESERVA_JSON[\s\S]*$/, "").trim();
+      if (lr && lr.error) {
+        console.error("RESERVA_JSON no se pudo leer:", lr.error, "|", lr.bloque);
+        avisarAdmins({ id: phoneNumber, telefono, texto: "⚠️ Vero intentó apartar pero no pudo leer los datos (" + lr.error + "). Revisa la conversación y agéndalo a mano." }).catch(() => {});
+      }
+      if (lr && lr.datos) {
         try {
-          const datos = JSON.parse(match[1]);
+          const datos = lr.datos;
           datos.contacto = phoneNumber;
           datos.telefono = (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber;
           const r = await crearEventoCalendar(datos);
@@ -1029,11 +1142,14 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
           } else if (r.ocupado) {
             mensajeCliente += "\n\nAy, justo acabo de revisar y esas fechas se acaban de ocupar 😔 ¿Buscamos otras fechas cercanas?";
           } else {
-            console.log("Evento creado en Calendar:", r.id);
+            console.log("Evento creado en Calendar:", r.id, datos.llegada, "-", datos.salida);
+            db.run("INSERT OR REPLACE INTO reservas_ult (id, datos, evento, creado) VALUES (?, ?, ?, ?)", [phoneNumber, JSON.stringify(datos), r.id, Date.now()]);
             await bitacora("Pendiente de pago", { ...datos, eventoId: r.id });
           }
         } catch (e) {
           console.error("Error creando evento de Calendar:", e.message);
+          db.run("INSERT OR REPLACE INTO reservas_ult (id, datos, evento, creado) VALUES (?, ?, NULL, ?)", [phoneNumber, JSON.stringify(lr.datos), Date.now()]);
+          avisarAdmins({ id: phoneNumber, telefono, texto: `⚠️ No se pudo apartar en el calendario ${lr.datos.llegada} al ${lr.datos.salida} (${e.message}). Se reintentará al confirmar el pago; revísalo.` }).catch(() => {});
         }
       }
       const cot = mensajeCliente.match(/COTIZACION_JSON:(\{.*?\})/);
@@ -1054,6 +1170,9 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         console.log("AVISO DE PAGO de", phoneNumber);
         marcarAvisoPago(phoneNumber).catch(e => console.error("Marcar aviso de pago:", e.message));
         await bitacora("Aviso de pago", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber });
+      }
+      if (!(lr && lr.datos) && (avisoPago === "si" || /012680004746940744|CLABE/i.test(mensajeCliente))) {
+        asegurarApartado(phoneNumber, telefono, avisoPago === "si" ? "El cliente avisó que ya pagó" : "Vero le mandó datos bancarios").catch(() => {});
       }
       let enviarFotos = "no";
       if (mensajeCliente.includes("ENVIAR_FOTOS")) {
@@ -1446,6 +1565,40 @@ function htmlReporte(dias, convs, a, nombres) {
 <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:15px;border-top:2px solid #1b2b34"><tr style="text-align:left;background:#1b2b34;color:#e2d6cb"><th style="padding:12px 14px">Contacto</th><th style="padding:12px 14px">Etapa</th><th style="padding:12px 14px">Último</th><th style="padding:12px 14px">Por qué se frenó</th><th style="padding:12px 14px">Qué hacer</th><th style="padding:12px 14px">Mensaje sugerido</th></tr>${filas}</table></div>
 <div style="color:#4b5a62;font-size:13px">Generado ${esc(new Date().toLocaleString("es-MX", { timeZone: "America/Mexico_City" }))}. Se guarda 30 min; agrega &amp;nuevo=1 para rehacerlo.</div></div></body></html>`;
 }
+// DIAGNOSTICO de una reserva: /diagnostico?clave=CLAVE&buscar=4611718139  (telefono, nombre o texto de la conversacion)
+app.get("/diagnostico", async (req, res) => {
+  if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
+  const q = String(req.query.buscar || "").trim();
+  if (!q) return res.type("text/plain").send("Agrega &buscar=telefono o nombre");
+  const out = [];
+  try {
+    const filas = await new Promise(ok => db.all("SELECT id, messages, updated_at FROM conversations WHERE id LIKE ? OR messages LIKE ? ORDER BY updated_at DESC LIMIT 5", [`%${q}%`, `%${q}%`], (e, r) => ok(e ? [] : r || [])));
+    if (!filas.length) out.push("No encontre conversaciones con: " + q);
+    for (const f of filas) {
+      const msgs = JSON.parse(f.messages || "[]");
+      out.push(`\n===== CONTACTO ${f.id} (ultima actividad ${f.updated_at} UTC, ${msgs.length} mensajes guardados) =====`);
+      const reservas = msgs.filter(m => m.role === "assistant" && /RESERVA_JSON/.test(String(m.content)));
+      out.push(reservas.length ? `RESERVA_JSON emitido ${reservas.length} vez/veces:` : "❌ Vero NUNCA emitio RESERVA_JSON en los mensajes guardados -> por eso no se aparto en el calendario.");
+      for (const m of reservas) { const lr = leerReservaJSON(m.content); out.push("  " + String(m.content).match(/RESERVA_JSON[\s\S]*$/)[0].slice(0, 300) + (lr && lr.error ? "  <- ERROR: " + lr.error : "")); }
+      out.push("Pagos confirmados por admin: " + msgs.filter(m => m.role === "user" && /PAGO_CONFIRMADO/.test(String(m.content))).length);
+      out.push("Avisos de pago (cliente dijo que pago): " + msgs.filter(m => m.role === "assistant" && /AVISO_PAGO/.test(String(m.content))).length);
+      const ult = await dbGet("SELECT * FROM reservas_ult WHERE id = ?", [f.id]);
+      out.push("Respaldo guardado: " + (ult ? ult.datos + " evento=" + ult.evento : "ninguno"));
+      const ev = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: [`contacto=${f.id}`], singleEvents: true, maxResults: 50 });
+      const items = (ev.data.items || []);
+      out.push(items.length ? "Eventos en Calendar ligados a este contacto:" : "❌ No hay NINGUN evento en Calendar ligado a este contacto.");
+      for (const e of items) out.push(`  ${e.status} | ${e.summary} | ${(e.start.dateTime || e.start.date)} -> ${(e.end.dateTime || e.end.date)}`);
+      out.push("--- Ultimos 16 mensajes ---");
+      for (const m of msgs.slice(-16)) out.push(`[${m.role === "user" ? "CLIENTE" : "VERO"}] ${String(typeof m.content === "string" ? m.content : JSON.stringify(m.content)).replace(/\s+/g, " ").slice(0, 400)}`);
+    }
+    for (const mes of ["2026-01", "2027-01"]) {
+      const ev = await calendar.events.list({ calendarId: CALENDAR_ID, timeMin: `${mes}-01T00:00:00-06:00`, timeMax: `${mes}-08T00:00:00-06:00`, singleEvents: true });
+      out.push(`\n===== Calendar 1-7 de ${mes} =====`);
+      for (const e of ev.data.items || []) out.push(`  ${e.summary} | ${(e.start.dateTime || e.start.date)} -> ${(e.end.dateTime || e.end.date)} | contacto=${e.extendedProperties?.private?.contacto || "-"}`);
+    }
+  } catch (e) { out.push("Error: " + e.message); }
+  res.type("text/plain").send(out.join("\n"));
+});
 app.get("/revisar", async (req, res) => {
   if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave: /revisar?clave=...");
   const dias = Math.min(60, Math.max(1, Number(req.query.dias) || 7));
@@ -1558,6 +1711,16 @@ app.get("/campana", async (req, res) => {
     res.type("text/plain").send(`✅ Enviados: ${ok} | Fallidos: ${mal}${lista.length === 250 ? "\nHay mas contactos: vuelve a abrir la liga con &enviar=1 para el siguiente bloque." : ""}`);
   } catch (e) { res.status(500).type("text/plain").send("Error: " + e.message); }
 });
+// Red de seguridad: cada 3 h revisa conversaciones de los ultimos 3 dias donde se hablo de pago y aparta lo que falte
+async function auditarApartados() {
+  const filas = await new Promise(ok => db.all("SELECT id, messages FROM conversations WHERE updated_at >= datetime('now', '-3 days')", [], (e, r) => ok(e ? [] : r || [])));
+  for (const f of filas) {
+    const txt = String(f.messages || "");
+    if (/PAGO_CONFIRMADO|AVISO_PAGO|012680004746940744/.test(txt)) await asegurarApartado(String(f.id), null, "Revisión automática: hubo pago o datos bancarios en la conversación");
+  }
+}
+setTimeout(() => auditarApartados().catch(e => console.error("Auditoria:", e.message)), 60000);
+setInterval(() => auditarApartados().catch(e => console.error("Auditoria:", e.message)), 3 * 3600000);
 // El dia 1 de cada mes (9:00 Mexico) se genera solo el reporte del mes anterior y se avisa a los administradores
 async function marketingMensual() {
   const d = new Date(Date.now() - MX); if (d.getUTCDate() !== 1 || d.getUTCHours() < 9) return;
