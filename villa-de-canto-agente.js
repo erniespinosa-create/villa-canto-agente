@@ -200,8 +200,22 @@ async function asegurarApartado(id, telefono, motivo) {
       }
     }
     const tel = (telefono && !String(telefono).includes("{{")) ? telefono : id;
+    // Si el admin lo agendo a mano (su ID o telefono aparece en un evento futuro), se marca el evento y no se avisa
+    const tel10 = String(tel).replace(/\D/g, "").slice(-10);
+    const futuros = await calendar.events.list({ calendarId: CALENDAR_ID, timeMin: new Date().toISOString(), singleEvents: true, maxResults: 250 });
+    const manual = (futuros.data.items || []).find(e => { if (e.status === "cancelled") return false; const s = (e.summary || "") + " " + (e.description || ""); return s.includes(String(id)) || (tel10.length === 10 && s.replace(/\D/g, "").includes(tel10)); });
+    if (manual) {
+      const priv = { ...(manual.extendedProperties?.private || {}), contacto: String(id) };
+      await calendar.events.patch({ calendarId: CALENDAR_ID, eventId: manual.id, requestBody: { extendedProperties: { private: priv } } }).catch(() => {});
+      return;
+    }
     if (!datos) {
       console.log("SIN APARTADO y sin cotizacion para", id, "-", motivo);
+      // Un solo aviso por contacto cada 7 dias (persistente, sobrevive reinicios)
+      await new Promise(ok => db.run("CREATE TABLE IF NOT EXISTS avisos_apartado (id TEXT PRIMARY KEY, t INTEGER)", [], () => ok()));
+      const prev = await dbGet("SELECT t FROM avisos_apartado WHERE id = ?", [id]);
+      if (prev && Date.now() - prev.t < 7 * 86400000) return;
+      db.run("INSERT OR REPLACE INTO avisos_apartado (id, t) VALUES (?, ?)", [id, Date.now()]);
       return avisarAdmins({ id, telefono, texto: `⚠️ ${motivo}, pero no hay reserva en el calendario ni cotización guardada. Agéndala a mano.` });
     }
     datos.contacto = id; datos.telefono = tel;
