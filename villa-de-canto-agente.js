@@ -1902,20 +1902,36 @@ async function supAlerta({ id = "", tipo, gravedad = "media", detalle, firma }) 
   return n;
 }
 
-async function supEnviar(texto) {
-  if (process.env.WHAPI_TOKEN && process.env.WHAPI_GRUPO) {
-    try {
-      const r = await fetch("https://gate.whapi.cloud/messages/text", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.WHAPI_TOKEN.trim()}` }, body: JSON.stringify({ to: process.env.WHAPI_GRUPO.trim(), body: texto }) });
-      if (r.ok) return true;
-      console.error("Supervisor -> grupo:", r.status, await r.text().catch(() => ""));
-    } catch (e) { console.error("Supervisor -> grupo:", e.message); }
-  }
-  let ok = false;
+// Los avisos del supervisor van SOLO a Emilio (nunca al grupo ni a los demas administradores).
+// SUPERVISOR_TEL = celular de Emilio. Si hay WHAPI_TOKEN se le manda por Whapi; si no, por ManyChat al
+// administrador de AVISO_ADMINS que tenga ese telefono (o al codigo de SUPERVISOR_ADMIN, si se define).
+let supAdminId = String(process.env.SUPERVISOR_ADMIN || "").trim();
+async function supDestinoManychat(tel10) {
+  if (supAdminId) return supAdminId;
+  if (!tel10) return "";
   for (const admin of ADMINS_AVISO) {
-    const s = await textoWA(admin, texto).catch(e => ({ status: e.message }));
-    if (s && s.status === "success") { ok = true; avisosEnviados.set(String(admin), Date.now()); } else console.error("Supervisor -> admin", admin, JSON.stringify(s));
+    const i = await infoContacto(admin).catch(() => ({}));
+    const t = String(i.whatsapp_phone || i.phone || "").replace(/\D/g, "").slice(-10);
+    if (t === tel10) { supAdminId = String(admin); return supAdminId; }
   }
-  return ok;
+  return "";
+}
+async function supEnviar(texto) {
+  const tel = String(process.env.SUPERVISOR_TEL || "").replace(/\D/g, "");
+  const tel10 = tel.slice(-10);
+  if (process.env.WHAPI_TOKEN && tel) {
+    try {
+      const r = await fetch("https://gate.whapi.cloud/messages/text", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.WHAPI_TOKEN.trim()}` }, body: JSON.stringify({ to: "52" + tel10, body: texto }) });
+      if (r.ok) return true;
+      console.error("Supervisor -> Emilio (Whapi):", r.status, await r.text().catch(() => ""));
+    } catch (e) { console.error("Supervisor -> Emilio (Whapi):", e.message); }
+  }
+  const admin = await supDestinoManychat(tel10);
+  if (!admin) { console.error("Supervisor: no encontré a Emilio en AVISO_ADMINS con SUPERVISOR_TEL", tel10 || "(vacío)", "; el aviso no se envió (sigue en el panel)."); return false; }
+  const s = await textoWA(admin, texto).catch(e => ({ status: e.message }));
+  if (s && s.status === "success") { avisosEnviados.set(admin, Date.now()); return true; }
+  console.error("Supervisor -> Emilio (ManyChat):", admin, JSON.stringify(s));
+  return false;
 }
 
 const linkSup = (extra = "") => `${URL_PUBLICA}/supervisor?${process.env.CLAVE_REVISION ? "clave=" + encodeURIComponent(process.env.CLAVE_REVISION) : ""}${extra}`;
