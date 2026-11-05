@@ -902,6 +902,17 @@ async function infoContacto(id) {
   } catch (e) { console.error("ManyChat getInfo:", e.message); return {}; }
 }
 
+// SUPERVISOR: registra cada mensaje que entra y lo que Vero contesto (para detectar silencios y errores)
+app.use("/webhook", (req, res, next) => {
+  if (req.method !== "POST") return next();
+  const t_in = Date.now(); let cuerpo = null, hecho = false;
+  const json0 = res.json.bind(res);
+  res.json = body => { cuerpo = body; return json0(body); };
+  const fin = cortada => { if (hecho) return; hecho = true; try { supEntrada(req, res, t_in, cuerpo, cortada); } catch (e) { console.error("Supervisor entrada:", e.message); } };
+  res.on("finish", () => fin(false));
+  res.on("close", () => fin(!res.writableFinished));
+  next();
+});
 app.post("/webhook", async (req, res) => {
   res.t0 = Date.now();
   const b = req.body || {};
@@ -1844,6 +1855,369 @@ async function marketingMensual() {
   }
 }
 setInterval(() => marketingMensual().catch(e => console.error("Marketing mensual:", e.message)), 60 * 60 * 1000);
+
+// ===== SUPERVISOR 24 h: vigila a Vero y avisa a los administradores cuando se equivoca =====
+// Panel: https://TU-APP.up.railway.app/supervisor?clave=TU_CLAVE   Revisar ya: &ahora=1
+db.run("CREATE TABLE IF NOT EXISTS sup_entradas (n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT, mensaje TEXT, t_in INTEGER, t_out INTEGER, status INTEGER, respuesta TEXT, omitido INTEGER, cortada INTEGER, revisado INTEGER DEFAULT 0)");
+db.run("CREATE TABLE IF NOT EXISTS sup_alertas (firma TEXT PRIMARY KEY, id TEXT, tipo TEXT, gravedad TEXT, detalle TEXT, t INTEGER, resuelta INTEGER DEFAULT 0, avisada INTEGER DEFAULT 0)");
+db.run("CREATE TABLE IF NOT EXISTS sup_estado (k TEXT PRIMARY KEY, v TEXT)");
+// Correcciones que el supervisor le ensena a Vero: se agregan a su prompt y se pueden quitar desde el panel
+db.run("CREATE TABLE IF NOT EXISTS sup_lecciones (n INTEGER PRIMARY KEY AUTOINCREMENT, texto TEXT, motivo TEXT, creado INTEGER, activa INTEGER DEFAULT 1, quitada INTEGER)", () => supCargarLecciones());
+let supLecciones = [];
+function supCargarLecciones() { db.all("SELECT n, texto FROM sup_lecciones WHERE activa = 1 ORDER BY n", [], (e, r) => { supLecciones = e ? supLecciones : r || []; }); }
+const systemPromptBase = systemPrompt;
+systemPrompt = () => systemPromptBase() + (supLecciones.length ? `\n\nCORRECCIONES DEL SUPERVISOR (errores que ya cometiste; obedecelas siempre, pero si alguna contradice las reglas de arriba, mandan las de arriba):\n${supLecciones.map(l => "- " + l.texto).join("\n")}` : "");
+const dbAll = (sql, args = []) => new Promise(ok => db.all(sql, args, (e, r) => ok(e ? [] : r || [])));
+const dbRun = (sql, args = []) => new Promise(ok => db.run(sql, args, function (e) { ok(e ? 0 : this.changes); }));
+const supGet = async k => (await dbGet("SELECT v FROM sup_estado WHERE k = ?", [k]) || {}).v;
+const supSet = (k, v) => dbRun("INSERT OR REPLACE INTO sup_estado (k, v) VALUES (?, ?)", [k, String(v)]);
+const SUP_TIPOS = {
+  SIN_RESPUESTA: "No contestó", ERROR: "Falló al procesar", FILTRO: "Mandó texto interno al cliente", LENTO: "Tardó demasiado",
+  NO_AGENDO: "No apartó en el calendario", RESERVA_MAL: "Reserva con datos incompletos", TRASLAPE: "Reservas encimadas",
+  FESTIVO_MINIMO: "1 noche en festivo/puente", CAIDA: "Vero estuvo apagada", PRECIO_MAL: "Precio o cotización mal",
+  NO_REVISO_DISPONIBILIDAD: "Cotizó sin revisar disponibilidad", DATO_FALSO: "Dio información falsa", NO_PIDIO_ANTICIPO: "No pidió anticipo/depósito",
+  NO_AVISO_ADMIN: "No avisó al administrador", PREGUNTA_DE_MAS: "Preguntó datos de más", NO_CERRO: "Dejó ir la venta", TONO: "Tono o redacción", OTRO: "Otro",
+};
+const SUP_FESTIVOS = [["2026-11-13", "2026-11-15"], ["2026-12-24", "2026-12-26"], ["2026-12-31", "2027-01-02"], ["2027-01-29", "2027-01-31"], ["2027-03-12", "2027-03-14"], ["2027-03-24", "2027-03-27"], ["2027-04-30", "2027-05-01"], ["2027-09-15", "2027-09-18"], ["2027-10-29", "2027-11-01"]];
+const diaMX = v => String(v).length === 10 ? String(v) : new Date(new Date(v).getTime() - MX).toISOString().slice(0, 10);
+const sumaDia = (d, n) => { const x = new Date(d + "T12:00:00Z"); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+const textoMsg = c => typeof c === "string" ? c : Array.isArray(c) ? c.map(b => b.type === "text" ? b.text : b.type === "tool_use" ? `[consultó ${b.name} ${JSON.stringify(b.input)}]` : b.type === "tool_result" ? `[resultado: ${String(typeof b.content === "string" ? b.content : JSON.stringify(b.content)).slice(0, 200)}]` : "").join(" ") : JSON.stringify(c);
+
+function supEntrada(req, res, t_in, cuerpo, cortada) {
+  const b = req.body || {};
+  const c = (b.last_input_text !== undefined ? b : Object.values(b).find(v => v && typeof v === "object" && "last_input_text" in v)) || {};
+  const id = String(b.phoneNumber || c.id || "");
+  if (!id || ADMINS_AVISO.includes(id)) return;
+  const omitido = cuerpo && (cuerpo.omitir === "si" || cuerpo.error) ? 1 : 0;
+  db.run("INSERT INTO sup_entradas (id, mensaje, t_in, t_out, status, respuesta, omitido, cortada) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    [id, String(b.message || c.last_input_text || "").slice(0, 500), t_in, Date.now(), res.statusCode, String(cuerpo?.response || "").slice(0, 2000), omitido, cortada ? 1 : 0]);
+}
+
+async function supAlerta({ id = "", tipo, gravedad = "media", detalle, firma }) {
+  const n = await dbRun("INSERT OR IGNORE INTO sup_alertas (firma, id, tipo, gravedad, detalle, t) VALUES (?, ?, ?, ?, ?, ?)", [firma, id, tipo, gravedad, String(detalle).slice(0, 600), Date.now()]);
+  if (n) console.log("SUPERVISOR:", tipo, id, "-", String(detalle).slice(0, 120));
+  return n;
+}
+
+async function supEnviar(texto) {
+  if (process.env.WHAPI_TOKEN && process.env.WHAPI_GRUPO) {
+    try {
+      const r = await fetch("https://gate.whapi.cloud/messages/text", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.WHAPI_TOKEN.trim()}` }, body: JSON.stringify({ to: process.env.WHAPI_GRUPO.trim(), body: texto }) });
+      if (r.ok) return true;
+      console.error("Supervisor -> grupo:", r.status, await r.text().catch(() => ""));
+    } catch (e) { console.error("Supervisor -> grupo:", e.message); }
+  }
+  let ok = false;
+  for (const admin of ADMINS_AVISO) {
+    const s = await textoWA(admin, texto).catch(e => ({ status: e.message }));
+    if (s && s.status === "success") { ok = true; avisosEnviados.set(String(admin), Date.now()); } else console.error("Supervisor -> admin", admin, JSON.stringify(s));
+  }
+  return ok;
+}
+
+const linkSup = (extra = "") => `${URL_PUBLICA}/supervisor?${process.env.CLAVE_REVISION ? "clave=" + encodeURIComponent(process.env.CLAVE_REVISION) : ""}${extra}`;
+async function supAvisarUrgentes() {
+  const filas = await dbAll("SELECT * FROM sup_alertas WHERE avisada = 0 AND resuelta = 0 AND gravedad = 'alta' ORDER BY t LIMIT 10");
+  if (!filas.length) return;
+  const lineas = [];
+  for (const a of filas) {
+    let quien = "";
+    if (a.id && /^\d+$/.test(a.id)) { const i = await infoContacto(a.id).catch(() => ({})); quien = [i.name || [i.first_name, i.last_name].filter(Boolean).join(" "), i.whatsapp_phone || i.phone].filter(Boolean).join(" · "); }
+    lineas.push(`• *${SUP_TIPOS[a.tipo] || a.tipo}*${quien ? " — " + quien : ""}\n  ${a.detalle}`);
+  }
+  const ok = await supEnviar(["🛡️ *Supervisor de Vero · revisar ya*", "", ...lineas, "", `Panel: ${linkSup()}`].join("\n"));
+  if (ok) for (const a of filas) await dbRun("UPDATE sup_alertas SET avisada = 1 WHERE firma = ?", [a.firma]);
+}
+
+// 1) Cada mensaje del cliente: ¿Vero contestó? ¿falló? ¿mandó texto interno? ¿tardó?
+async function supRevisarEntradas() {
+  const limite = Date.now() - 6 * 60000;
+  const filas = await dbAll("SELECT * FROM sup_entradas WHERE revisado = 0 AND t_in < ? ORDER BY n LIMIT 300", [limite]);
+  const pausas = new Map((await dbAll("SELECT id, hasta FROM pausas")).map(x => [String(x.id), x.hasta]));
+  for (const e of filas) {
+    await dbRun("UPDATE sup_entradas SET revisado = 1 WHERE n = ?", [e.n]);
+    const hora = new Date(e.t_in - MX).toISOString().slice(11, 16);
+    const dijo = `"${String(e.mensaje || "(mensaje leído de ManyChat)").replace(/\s+/g, " ").slice(0, 120)}"`;
+    if (e.status >= 500 || e.cortada) {
+      await supAlerta({ id: e.id, tipo: "ERROR", gravedad: "alta", detalle: `A las ${hora} el cliente escribió ${dijo} y el servidor falló (código ${e.cortada ? "conexión cortada" : e.status}).`, firma: `error:${e.id}:${Math.floor(e.t_in / 3600000)}` });
+      continue;
+    }
+    if (e.omitido || (pausas.get(e.id) || 0) > e.t_in) continue;
+    const conv = await dbGet("SELECT messages, updated_at FROM conversations WHERE id = ?", [e.id]);
+    const msgs = conv ? JSON.parse(conv.messages || "[]") : [];
+    const upd = conv ? new Date(String(conv.updated_at).replace(" ", "T") + "Z").getTime() : 0;
+    const ultimo = msgs[msgs.length - 1];
+    const contesto = String(e.respuesta).trim() || (ultimo && ultimo.role === "assistant" && upd >= e.t_in - 5000 && textoMsg(ultimo.content).trim());
+    if ((pausas.get(e.id) || 0) > Date.now()) continue;
+    if (!contesto) {
+      const firma = `sinresp:${e.id}:${Math.floor(e.t_in / 3600000)}`;
+      const nueva = await supAlerta({ id: e.id, tipo: "SIN_RESPUESTA", gravedad: "alta", detalle: `A las ${hora} el cliente escribió ${dijo} y Vero no le contestó.`, firma });
+      // Rescate: el supervisor le pide a Vero que conteste ya (solo dentro de la ventana de 24 h de WhatsApp)
+      if (nueva && process.env.SUP_RESCATAR !== "no" && Date.now() - e.t_in < 23 * 3600000) {
+        const r = await supRescatar(e.id, e.mensaje);
+        await dbRun("UPDATE sup_alertas SET detalle = detalle || ? WHERE firma = ?", [r ? ` ✅ El supervisor hizo que Vero le contestara: "${r.replace(/\s+/g, " ").slice(0, 140)}"` : " ❌ El supervisor intentó que Vero contestara y no se pudo: escíbele tú.", firma]);
+      }
+      continue;
+    }
+    const enviado = String(e.respuesta || textoMsg(ultimo?.content));
+    if (/RESERVA_JSON|AVISO_PAGO|PAGO_CONFIRMADO|\[SISTEMA\]|tool_use|```|\bundefined\b|\bNaN\b|\{\{|\[object Object\]/.test(enviado)) {
+      await supAlerta({ id: e.id, tipo: "FILTRO", gravedad: "alta", detalle: `A las ${hora} Vero le mandó al cliente texto interno o roto: "${enviado.replace(/\s+/g, " ").slice(0, 160)}"`, firma: `filtro:${e.id}:${e.n}` });
+    }
+    if (e.t_out - e.t_in > 12000) {
+      await supAlerta({ id: e.id, tipo: "LENTO", gravedad: "baja", detalle: `Tardó ${Math.round((e.t_out - e.t_in) / 1000)} s en contestar ${dijo} (ManyChat espera máximo ~10 s).`, firma: `lento:${e.id}:${diaMX(e.t_in)}` });
+    }
+  }
+  await dbRun("DELETE FROM sup_entradas WHERE t_in < ?", [Date.now() - 30 * 86400000]);
+}
+
+function supRescatar(id, mensaje) {
+  return new Promise(resolve => {
+    const nota = `[SISTEMA] Tu respuesta al ultimo mensaje del cliente${mensaje ? ` ("${String(mensaje).slice(0, 300)}")` : ""} NO le llego por una falla tecnica. Contestale AHORA lo que pregunto o pidio, empezando con una disculpa breve por la demora (una sola frase, sin explicar la falla). No te presentes de nuevo ni repitas preguntas que ya contesto.`;
+    anotarHistorial(id, nota, () => {
+      db.get("SELECT messages FROM conversations WHERE id = ?", [id], async (err, row) => {
+        try {
+          const history = row ? JSON.parse(row.messages) : [];
+          let reply = await responderConClaude(history, id);
+          reply = String(reply).replace(/COTIZACION_JSON:\{.*?\}|NO_INTERESADO|PASAR_A_HUMANO|FOTOS_ESPECIFICAS:[^\n]*|FOTOS_CASA|FOTOS_PINATAS|RESERVA_JSON[\s\S]*$/g, "").replace(/\*\*(.+?)\*\*/g, "*$1*").trim();
+          if (!reply) return resolve("");
+          history.push({ role: "assistant", content: reply });
+          while (history.length > 40) history.shift();
+          while (history.length && history[0].role !== "user") history.shift();
+          db.run("INSERT OR REPLACE INTO conversations (id, messages, updated_at) VALUES (?, ?, datetime('now'))", [id, JSON.stringify(history)]);
+          await enviarPorManyChat(id, reply);
+          console.log("SUPERVISOR rescato la conversacion de", id);
+          resolve(reply);
+        } catch (e) { console.error("Supervisor rescate:", e.message); resolve(""); }
+      });
+    });
+  });
+}
+
+// 2) Conversaciones con pago o reserva que no quedaron en el calendario
+async function supRevisarAgenda() {
+  const filas = await dbAll("SELECT id, messages FROM conversations WHERE updated_at >= datetime('now', '-3 days')");
+  for (const f of filas) {
+    const txt = String(f.messages || "");
+    if (!/RESERVA_JSON|AVISO_PAGO|PAGO_CONFIRMADO/.test(txt)) continue;
+    const msgs = JSON.parse(txt || "[]");
+    const conRes = msgs.filter(m => m.role === "assistant" && /RESERVA_JSON/.test(textoMsg(m.content)));
+    const lr = conRes.length ? leerReservaJSON(textoMsg(conRes[conRes.length - 1].content)) : null;
+    if (lr && lr.error) await supAlerta({ id: f.id, tipo: "RESERVA_MAL", gravedad: "alta", detalle: `Vero intentó apartar pero la reserva salió mal: ${lr.error}`, firma: `resmal:${f.id}:${lr.error}` });
+    try {
+      const ev = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: [`contacto=${f.id}`], singleEvents: true, maxResults: 20 });
+      const vivos = (ev.data.items || []).filter(e => e.status !== "cancelled");
+      if (!vivos.length) {
+        const motivo = /PAGO_CONFIRMADO/.test(txt) ? "el administrador confirmó un pago" : /AVISO_PAGO/.test(txt) ? "el cliente avisó que pagó" : "Vero generó una reserva";
+        await supAlerta({ id: f.id, tipo: "NO_AGENDO", gravedad: "alta", detalle: `En esta conversación ${motivo}, pero no hay ningún evento en Google Calendar para este cliente.`, firma: `noagendo:${f.id}` });
+      }
+    } catch (e) { console.error("Supervisor agenda:", e.message); }
+  }
+}
+
+// 3) Salud del calendario: reservas encimadas y festivos de 1 noche
+async function supRevisarCalendario() {
+  const r = await calendar.events.list({ calendarId: CALENDAR_ID, timeMin: new Date(Date.now() - 86400000).toISOString(), timeMax: new Date(Date.now() + 400 * 86400000).toISOString(), singleEvents: true, orderBy: "startTime", maxResults: 250 });
+  const evs = (r.data.items || []).filter(e => e.status !== "cancelled" && esReserva(e)).map(e => ({ e, ini: diaMX(e.start.date || e.start.dateTime), fin: diaMX(e.end.date || e.end.dateTime) })).sort((a, b) => a.ini.localeCompare(b.ini));
+  for (let i = 0; i < evs.length; i++) {
+    for (let j = i + 1; j < evs.length && evs[j].ini < evs[i].fin; j++) {
+      await supAlerta({ tipo: "TRASLAPE", gravedad: "alta", detalle: `"${evs[i].e.summary}" (${evs[i].ini} → ${evs[i].fin}) se encima con "${evs[j].e.summary}" (${evs[j].ini} → ${evs[j].fin}).`, firma: `traslape:${evs[i].e.id}:${evs[j].e.id}` });
+    }
+    const { ini, fin, e } = evs[i];
+    if (sumaDia(ini, 1) === fin && SUP_FESTIVOS.some(([a, b]) => ini >= a && ini < b)) {
+      await supAlerta({ id: e.extendedProperties?.private?.contacto || "", tipo: "FESTIVO_MINIMO", gravedad: "media", detalle: `"${e.summary}" reservó solo 1 noche (${ini}) en festivo/puente; el mínimo es 2.`, firma: `festivo:${e.id}` });
+    }
+  }
+}
+
+// 4) Auditoria con IA: lee las conversaciones nuevas y las compara contra las reglas de Vero
+async function supAuditarConIA() {
+  const desde = Number(await supGet("ultima_ia") || Date.now() - 3 * 3600000);
+  const ahora = Date.now();
+  const filas = await dbAll("SELECT id, messages, updated_at FROM conversations WHERE updated_at >= datetime(?, 'unixepoch') ORDER BY updated_at DESC LIMIT 25", [Math.floor(desde / 1000)]);
+  await supSet("ultima_ia", ahora);
+  const convs = filas.map(f => ({ id: String(f.id), msgs: JSON.parse(f.messages || "[]").slice(-30) })).filter(c => c.msgs.some(m => m.role === "assistant") && !ADMINS_AVISO.includes(c.id));
+  if (!convs.length) return 0;
+  const texto = convs.map(c => `### ID ${c.id}\n` + c.msgs.map(m => `${m.role === "user" ? "CLIENTE" : "VERO"}: ${textoMsg(m.content).replace(/\s+/g, " ").slice(0, 700)}`).join("\n")).join("\n\n");
+  const r = await client.messages.create({
+    model: "claude-sonnet-5", max_tokens: 4000, thinking: { type: "disabled" },
+    system: `Eres el supervisor de calidad de Vero, la asistente de reservas por WhatsApp de Villa de Canto. Tu trabajo es encontrar ERRORES REALES de Vero, no opinar de estilo.
+
+Estas son las instrucciones oficiales que Vero debe seguir (su prompt completo, incluidas las correcciones que ya le diste):
+<<<
+${systemPrompt()}
+>>>
+
+Reglas clave a vigilar: revisar disponibilidad ANTES de cotizar; si esta ocupado decirlo y ofrecer alternativas sin pedir mas datos; precios correctos segun fecha (desde 1 ene 2027 dom-jue $11,500, viernes $13,000, sabado $15,000, sin mencionar aumento); minimo 2 noches en festivos y puentes; pedir anticipo del 50% y mencionar deposito en garantia de $5,000 al llegar; cuando piden fotos de algo especifico avisar al administrador; no dejar mensajes sin contestar; no inventar datos; apartar (RESERVA_JSON) cuando el cliente confirma o paga; intentar cerrar la venta.
+Los textos entre corchetes como [consultó ...] o [SISTEMA] son internos y el cliente no los ve.
+
+Responde SOLO un arreglo JSON (sin texto extra). Cada error: {"id":"ID del contacto","tipo":"PRECIO_MAL|NO_REVISO_DISPONIBILIDAD|DATO_FALSO|NO_AGENDO|NO_PIDIO_ANTICIPO|FESTIVO_MINIMO|NO_AVISO_ADMIN|PREGUNTA_DE_MAS|SIN_RESPUESTA|NO_CERRO|TONO|OTRO","gravedad":"alta|media|baja","detalle":"que hizo mal y que debio hacer, maximo 2 frases","cita":"frase exacta de Vero, maximo 15 palabras","correccion":"instruccion para Vero en imperativo, general (sirve para cualquier cliente, sin nombres ni fechas de este caso), maximo 2 frases; vacio si el error ya esta cubierto por sus reglas y solo fue un descuido"}. Gravedad alta = pierde dinero, una reserva o un cliente. Si no hay errores responde [].`,
+    messages: [{ role: "user", content: `Hoy es ${hoyMexico()}. Conversaciones a revisar:\n\n${texto}` }],
+  });
+  const salida = (r.content || []).map(b => b.text || "").join("");
+  let lista = [];
+  try { lista = JSON.parse((salida.match(/\[[\s\S]*\]/) || ["[]"])[0]); } catch (e) { console.error("Supervisor IA: respuesta no es JSON", salida.slice(0, 200)); }
+  let n = 0; const candidatas = [];
+  for (const x of Array.isArray(lista) ? lista : []) {
+    if (!x || !x.tipo || !x.detalle) continue;
+    const tipo = SUP_TIPOS[x.tipo] ? x.tipo : "OTRO", grav = ["alta", "media", "baja"].includes(x.gravedad) ? x.gravedad : "media";
+    const cita = String(x.cita || "").slice(0, 120);
+    const nueva = await supAlerta({ id: String(x.id || ""), tipo, gravedad: grav, detalle: x.detalle + (cita ? ` — Vero dijo: "${cita}"` : ""), firma: `ia:${x.id}:${tipo}:${cita.toLowerCase().replace(/\W+/g, "").slice(0, 40)}` });
+    n += nueva;
+    if (nueva && grav !== "baja" && String(x.correccion || "").trim()) candidatas.push({ correccion: String(x.correccion).trim().slice(0, 400), error: `${SUP_TIPOS[tipo]}: ${x.detalle}` });
+  }
+  console.log("Supervisor IA:", convs.length, "conversaciones,", n, "errores nuevos,", candidatas.length, "correcciones propuestas");
+  if (candidatas.length && process.env.SUP_AUTOCORREGIR !== "no") await supAplicarCorrecciones(candidatas).catch(e => console.error("Supervisor correcciones:", e.message));
+  return n;
+}
+
+// 4b) Convierte los errores en correcciones para Vero (sin duplicar ni contradecir) y avisa que se implementaron
+async function supAplicarCorrecciones(candidatas) {
+  const activas = await dbAll("SELECT n, texto FROM sup_lecciones WHERE activa = 1 ORDER BY n");
+  const r = await client.messages.create({
+    model: "claude-sonnet-5", max_tokens: 2000, thinking: { type: "disabled" },
+    system: `Mantienes la lista de CORRECCIONES que se agregan al prompt de Vero (asistente de reservas de Villa de Canto) para que no repita errores.
+Reglas oficiales de Vero:
+<<<
+${systemPromptBase()}
+>>>
+Recibes las correcciones activas (con numero) y correcciones nuevas propuestas. Decide:
+- agregar: solo las nuevas que de verdad cambian el comportamiento, redactadas en imperativo, claras, generales, maximo 2 frases cada una. NO agregues lo que ya dicen las reglas oficiales o una correccion activa.
+- reemplazar: si una nueva mejora o amplia una activa, reescribe la activa (mismo numero) en vez de agregar otra.
+- quitar: activas que quedaron duplicadas o contradicen las reglas oficiales.
+Nunca propongas cambiar precios, fechas de festivos, anticipo, deposito ni politicas del negocio: eso solo lo decide el dueno.
+Maximo 25 correcciones activas en total.
+Responde SOLO JSON: {"agregar":[{"texto":"...","motivo":"error que la origino, 1 frase"}],"reemplazar":[{"n":1,"texto":"...","motivo":"..."}],"quitar":[{"n":2,"motivo":"..."}]}`,
+    messages: [{ role: "user", content: `Correcciones activas:\n${activas.map(a => `${a.n}. ${a.texto}`).join("\n") || "(ninguna)"}\n\nPropuestas nuevas:\n${candidatas.map((c, i) => `${i + 1}. ${c.correccion}  (por: ${c.error})`).join("\n")}` }],
+  });
+  const raw = (r.content || []).map(b => b.text || "").join("");
+  let d = {};
+  try { d = JSON.parse(raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1)); } catch (e) { console.error("Supervisor correcciones: no es JSON", raw.slice(0, 200)); return; }
+  const ids = new Set(activas.map(a => a.n)), cambios = [];
+  for (const x of (d.quitar || []).filter(x => ids.has(Number(x.n)))) {
+    await dbRun("UPDATE sup_lecciones SET activa = 0, quitada = ? WHERE n = ?", [Date.now(), Number(x.n)]);
+    cambios.push(`➖ Quité la #${x.n}: ${activas.find(a => a.n === Number(x.n)).texto}${x.motivo ? ` _(${x.motivo})_` : ""}`);
+  }
+  for (const x of (d.reemplazar || []).filter(x => ids.has(Number(x.n)) && x.texto)) {
+    await dbRun("UPDATE sup_lecciones SET texto = ?, motivo = ?, creado = ? WHERE n = ?", [String(x.texto).slice(0, 400), String(x.motivo || ""), Date.now(), Number(x.n)]);
+    cambios.push(`✏️ Ajusté la #${x.n}: ${x.texto}${x.motivo ? ` _(${x.motivo})_` : ""}`);
+  }
+  for (const x of (d.agregar || []).filter(x => x && x.texto).slice(0, Math.max(0, 25 - activas.length))) {
+    const n = await new Promise(ok => db.run("INSERT INTO sup_lecciones (texto, motivo, creado) VALUES (?, ?, ?)", [String(x.texto).slice(0, 400), String(x.motivo || ""), Date.now()], function (e) { ok(e ? 0 : this.lastID); }));
+    if (n) cambios.push(`➕ Nueva #${n}: ${x.texto}${x.motivo ? ` _(por: ${x.motivo})_` : ""}`);
+  }
+  supCargarLecciones();
+  if (!cambios.length) return;
+  await supEnviar(["🛠️ *Supervisor de Vero · cambios implementados*", "Ya le enseñé a Vero a corregir esto (aplica desde su siguiente mensaje):", "", ...cambios, "", `Para quitar alguno: ${linkSup()}#correcciones`].join("\n"));
+  console.log("Supervisor: cambios implementados en Vero", cambios.length);
+}
+
+// 5) Resumen diario a las 21:00 con todo lo que no fue urgente
+async function supResumenDiario() {
+  const loc = new Date(Date.now() - MX), hoy = loc.toISOString().slice(0, 10);
+  if (loc.getUTCHours() < 21 || await supGet("resumen") === hoy) return;
+  await supSet("resumen", hoy);
+  const desde = Date.now() - 86400000;
+  const [ent] = await dbAll("SELECT COUNT(*) n, AVG(t_out - t_in) prom FROM sup_entradas WHERE t_in >= ?", [desde]);
+  const al = await dbAll("SELECT tipo, gravedad, COUNT(*) n FROM sup_alertas WHERE t >= ? GROUP BY tipo, gravedad ORDER BY n DESC", [desde]);
+  const total = al.reduce((s, a) => s + a.n, 0);
+  const lineas = al.map(a => `• ${SUP_TIPOS[a.tipo] || a.tipo}: ${a.n}${a.gravedad === "alta" ? " ⚠️" : ""}`);
+  await supEnviar(["🛡️ *Supervisor de Vero · resumen del día*", "", `Mensajes atendidos: ${ent?.n || 0} · respuesta promedio ${Math.round((ent?.prom || 0) / 1000)} s`, total ? `Errores detectados: ${total}` : "✅ Sin errores detectados hoy.", ...lineas, "", `Detalle: ${linkSup()}`].join("\n"));
+  await dbRun("UPDATE sup_alertas SET avisada = 1 WHERE t >= ?", [desde]);
+}
+
+let supCorriendo = false;
+async function supervisar(conIA) {
+  if (supCorriendo) return; supCorriendo = true;
+  try {
+    await supRevisarEntradas().catch(e => console.error("Supervisor entradas:", e.message));
+    await supRevisarAgenda().catch(e => console.error("Supervisor agenda:", e.message));
+    if (conIA) {
+      await supRevisarCalendario().catch(e => console.error("Supervisor calendario:", e.message));
+      await supAuditarConIA().catch(e => console.error("Supervisor IA:", e.message));
+    }
+    await supAvisarUrgentes().catch(e => console.error("Supervisor avisos:", e.message));
+    await supResumenDiario().catch(e => console.error("Supervisor resumen:", e.message));
+  } finally { supCorriendo = false; }
+}
+// Latido: si el servidor estuvo apagado mas de 10 min, al volver avisa cuanto tiempo estuvo fuera
+setTimeout(async () => {
+  const prev = Number(await supGet("latido") || 0);
+  if (prev && Date.now() - prev > 10 * 60000) {
+    const h = t => new Date(t - MX).toISOString().slice(0, 16).replace("T", " ");
+    await supAlerta({ tipo: "CAIDA", gravedad: "alta", detalle: `Vero estuvo fuera de línea ${Math.round((Date.now() - prev) / 60000)} min (de ${h(prev)} a ${h(Date.now())}). Los mensajes de ese rato pudieron quedarse sin respuesta.`, firma: `caida:${prev}` });
+  }
+  setInterval(() => supSet("latido", Date.now()), 60000);
+  supSet("latido", Date.now());
+}, 20000);
+setInterval(() => supervisar(false), 5 * 60000);
+setInterval(() => supervisar(true), 2 * 3600000);
+setTimeout(() => supervisar(true), 5 * 60000);
+
+app.get("/supervisor/leccion", async (req, res) => {
+  if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
+  const n = Number(req.query.n), activar = req.query.accion === "activar";
+  const l = await dbGet("SELECT * FROM sup_lecciones WHERE n = ?", [n]);
+  if (l) {
+    await dbRun("UPDATE sup_lecciones SET activa = ?, quitada = ? WHERE n = ?", [activar ? 1 : 0, activar ? null : Date.now(), n]);
+    supCargarLecciones();
+    console.log("Correccion", n, activar ? "reactivada" : "quitada", "por el administrador");
+  }
+  res.redirect(linkSup() + "#correcciones");
+});
+app.get("/supervisor/resolver", async (req, res) => {
+  if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
+  if (req.query.firma === "todas") await dbRun("UPDATE sup_alertas SET resuelta = 1 WHERE resuelta = 0");
+  else await dbRun("UPDATE sup_alertas SET resuelta = 1 - resuelta WHERE firma = ?", [String(req.query.firma || "")]);
+  res.redirect(linkSup(req.query.ver ? "&ver=" + encodeURIComponent(req.query.ver) : ""));
+});
+app.get("/supervisor", async (req, res) => {
+  if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave: /supervisor?clave=...");
+  if (req.query.ahora) await supervisar(true);
+  const ver = req.query.ver === "resueltas" ? "resueltas" : "abiertas";
+  const desde = Date.now() - 86400000;
+  const [ent] = await dbAll("SELECT COUNT(*) n, AVG(t_out - t_in) prom, SUM(CASE WHEN status >= 500 OR cortada = 1 THEN 1 ELSE 0 END) fallos FROM sup_entradas WHERE t_in >= ?", [desde]);
+  const [sr] = await dbAll("SELECT COUNT(*) n FROM sup_alertas WHERE tipo = 'SIN_RESPUESTA' AND t >= ?", [desde]);
+  const [ab] = await dbAll("SELECT COUNT(*) n FROM sup_alertas WHERE resuelta = 0");
+  const al = await dbAll(`SELECT * FROM sup_alertas WHERE resuelta = ? ORDER BY CASE gravedad WHEN 'alta' THEN 0 WHEN 'media' THEN 1 ELSE 2 END, t DESC LIMIT 200`, [ver === "resueltas" ? 1 : 0]);
+  const latido = Number(await supGet("latido") || 0), ultIA = Number(await supGet("ultima_ia") || 0);
+  const lecs = await dbAll("SELECT * FROM sup_lecciones ORDER BY activa DESC, creado DESC LIMIT 60");
+  const clave = process.env.CLAVE_REVISION ? "&clave=" + encodeURIComponent(process.env.CLAVE_REVISION) : "";
+  const hora = t => t ? new Date(t - MX).toISOString().slice(0, 16).replace("T", " ") : "—";
+  const color = g => g === "alta" ? "#ec3013" : g === "media" ? "#201e1d" : "#8a8584";
+  const stat = (n, l) => `<div style="padding:20px 24px;border-right:2px solid #201e1d"><div style="font-size:44px;font-weight:700;line-height:1">${n}</div><div style="margin-top:8px;font-size:13px;text-transform:uppercase;letter-spacing:.06em">${l}</div></div>`;
+  const filasHTML = al.map(a => `<tr style="border-top:1px solid #d6d3d2;vertical-align:top">
+    <td style="padding:14px 12px;white-space:nowrap"><span style="display:inline-block;padding:3px 8px;font-size:12px;font-weight:700;text-transform:uppercase;color:#fff;background:${color(a.gravedad)}">${a.gravedad}</span></td>
+    <td style="padding:14px 12px;font-weight:700">${esc(SUP_TIPOS[a.tipo] || a.tipo)}</td>
+    <td style="padding:14px 12px;line-height:1.45;max-width:560px">${esc(a.detalle)}</td>
+    <td style="padding:14px 12px;white-space:nowrap">${a.id ? `<a href="${URL_PUBLICA}/diagnostico?buscar=${encodeURIComponent(a.id)}${clave}" style="color:#b8240e">${esc(a.id)}</a>` : "—"}</td>
+    <td style="padding:14px 12px;white-space:nowrap;font-variant-numeric:tabular-nums">${hora(a.t)}</td>
+    <td style="padding:14px 12px"><a href="${URL_PUBLICA}/supervisor/resolver?firma=${encodeURIComponent(a.firma)}&ver=${ver}${clave}" style="display:inline-block;padding:6px 12px;border:2px solid #201e1d;color:#201e1d;text-decoration:none;font-weight:700;font-size:13px">${a.resuelta ? "Reabrir" : "Resuelto"}</a></td></tr>`).join("");
+  res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="300"><title>Supervisor de Vero</title>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;700&display=swap" rel="stylesheet"></head>
+<body style="margin:0;background:#f3f2f2;color:#201e1d;font-family:Archivo,system-ui,sans-serif">
+<div style="max-width:1200px;margin:0 auto;padding:32px 24px">
+<div style="display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;border-bottom:2px solid #201e1d;padding-bottom:16px">
+  <div><div style="font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#b8240e;font-weight:700">Villa de Canto · 24 h</div><h1 style="margin:6px 0 0;font-size:40px;line-height:1.05">Supervisor de Vero</h1></div>
+  <div style="font-size:14px;line-height:1.6">Último latido: ${hora(latido)}<br>Última revisión con IA: ${hora(ultIA)}</div>
+</div>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));border-bottom:2px solid #201e1d">
+  ${stat(ent?.n || 0, "Mensajes 24 h")}${stat(sr?.n || 0, "Sin respuesta 24 h")}${stat(ent?.fallos || 0, "Fallos 24 h")}${stat(Math.round((ent?.prom || 0) / 1000) + " s", "Respuesta promedio")}${stat(ab?.n || 0, "Errores abiertos")}
+</div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin:24px 0 16px">
+  <a href="${linkSup()}" style="padding:10px 16px;font-weight:700;text-decoration:none;${ver === "abiertas" ? "background:#ec3013;color:#fff" : "border:2px solid #201e1d;color:#201e1d"}">Abiertos</a>
+  <a href="${linkSup("&ver=resueltas")}" style="padding:10px 16px;font-weight:700;text-decoration:none;${ver === "resueltas" ? "background:#ec3013;color:#fff" : "border:2px solid #201e1d;color:#201e1d"}">Resueltos</a>
+  <a href="${linkSup("&ahora=1")}" style="padding:10px 16px;font-weight:700;text-decoration:none;border:2px solid #201e1d;color:#201e1d">Revisar ahora</a>
+  ${ver === "abiertas" && al.length ? `<a href="${URL_PUBLICA}/supervisor/resolver?firma=todas${clave}" style="padding:10px 16px;font-weight:700;text-decoration:none;border:2px solid #201e1d;color:#201e1d">Marcar todo resuelto</a>` : ""}
+</div>
+${al.length ? `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:15px"><thead><tr style="border-bottom:2px solid #201e1d;text-align:left;font-size:12px;text-transform:uppercase;letter-spacing:.06em"><th style="padding:10px 12px">Gravedad</th><th style="padding:10px 12px">Error</th><th style="padding:10px 12px">Qué pasó</th><th style="padding:10px 12px">Contacto</th><th style="padding:10px 12px">Hora</th><th style="padding:10px 12px"></th></tr></thead><tbody>${filasHTML}</tbody></table></div>` : `<p style="font-size:20px;padding:32px 0;border-top:2px solid #201e1d">${ver === "abiertas" ? "Sin errores abiertos. Vero va bien." : "Nada resuelto todavía."}</p>`}
+<h2 id="correcciones" style="margin:48px 0 0;font-size:28px;padding-bottom:12px;border-bottom:2px solid #201e1d">Correcciones que el supervisor le enseñó a Vero</h2>
+${lecs.length ? lecs.map(l => `<div style="display:grid;grid-template-columns:56px minmax(0,1fr) auto;gap:16px;align-items:start;padding:16px 0;border-bottom:1px solid #d6d3d2;${l.activa ? "" : "opacity:.5"}">
+  <div style="font-size:22px;font-weight:700;color:${l.activa ? "#ec3013" : "#8a8584"}">#${l.n}</div>
+  <div><div style="font-size:16px;line-height:1.45;font-weight:700">${esc(l.texto)}</div><div style="margin-top:6px;font-size:13px;line-height:1.4">${l.motivo ? "Por: " + esc(l.motivo) + " · " : ""}${l.activa ? "Activa desde " + hora(l.creado) : "Quitada " + hora(l.quitada)}</div></div>
+  <a href="${URL_PUBLICA}/supervisor/leccion?n=${l.n}&accion=${l.activa ? "quitar" : "activar"}${clave}" style="padding:6px 12px;border:2px solid #201e1d;color:#201e1d;text-decoration:none;font-weight:700;font-size:13px;white-space:nowrap">${l.activa ? "Quitar" : "Volver a activar"}</a>
+</div>`).join("") : `<p style="font-size:16px;padding:16px 0">Todavía no hay correcciones. Cuando el supervisor encuentre un error, aquí aparecerá lo que le enseñó a Vero.</p>`}
+</div></body></html>`);
+});
 
 const server = app.listen(PORT, () => console.log(`Agente Vero en puerto ${PORT}`));
 setInterval(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 60 * 60 * 1000);
