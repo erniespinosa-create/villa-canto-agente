@@ -1862,7 +1862,10 @@ db.run("CREATE TABLE IF NOT EXISTS sup_entradas (n INTEGER PRIMARY KEY AUTOINCRE
 db.run("CREATE TABLE IF NOT EXISTS sup_alertas (firma TEXT PRIMARY KEY, id TEXT, tipo TEXT, gravedad TEXT, detalle TEXT, t INTEGER, resuelta INTEGER DEFAULT 0, avisada INTEGER DEFAULT 0)");
 db.run("CREATE TABLE IF NOT EXISTS sup_estado (k TEXT PRIMARY KEY, v TEXT)");
 // Correcciones que el supervisor le ensena a Vero: se agregan a su prompt y se pueden quitar desde el panel
-db.run("CREATE TABLE IF NOT EXISTS sup_lecciones (n INTEGER PRIMARY KEY AUTOINCREMENT, texto TEXT, motivo TEXT, creado INTEGER, activa INTEGER DEFAULT 1, quitada INTEGER)", () => supCargarLecciones());
+db.run("CREATE TABLE IF NOT EXISTS sup_lecciones (n INTEGER PRIMARY KEY AUTOINCREMENT, texto TEXT, motivo TEXT, creado INTEGER, activa INTEGER DEFAULT 1, quitada INTEGER)", () => {
+  // Propuestas por aprobar: pendiente 1 = espera al dueno, 2 = rechazada. accion = agregar | reemplazar | quitar; reemplaza = # de la correccion afectada
+  db.run("ALTER TABLE sup_lecciones ADD COLUMN pendiente INTEGER DEFAULT 0", () => db.run("ALTER TABLE sup_lecciones ADD COLUMN accion TEXT", () => db.run("ALTER TABLE sup_lecciones ADD COLUMN reemplaza INTEGER", () => supCargarLecciones())));
+});
 let supLecciones = [];
 function supCargarLecciones() { db.all("SELECT n, texto FROM sup_lecciones WHERE activa = 1 ORDER BY n", [], (e, r) => { supLecciones = e ? supLecciones : r || []; }); }
 const systemPromptBase = systemPrompt;
@@ -2063,7 +2066,7 @@ Responde SOLO un arreglo JSON (sin texto extra). Cada error: {"id":"ID del conta
     const cita = String(x.cita || "").slice(0, 120);
     const nueva = await supAlerta({ id: String(x.id || ""), tipo, gravedad: grav, detalle: x.detalle + (cita ? ` — Vero dijo: "${cita}"` : ""), firma: `ia:${x.id}:${tipo}:${cita.toLowerCase().replace(/\W+/g, "").slice(0, 40)}` });
     n += nueva;
-    if (nueva && grav !== "baja" && String(x.correccion || "").trim()) candidatas.push({ correccion: String(x.correccion).trim().slice(0, 400), error: `${SUP_TIPOS[tipo]}: ${x.detalle}` });
+    if (nueva && String(x.correccion || "").trim()) candidatas.push({ correccion: String(x.correccion).trim().slice(0, 400), error: `${SUP_TIPOS[tipo]}: ${x.detalle}` });
   }
   console.log("Supervisor IA:", convs.length, "conversaciones,", n, "errores nuevos,", candidatas.length, "correcciones propuestas");
   if (candidatas.length && process.env.SUP_AUTOCORREGIR !== "no") await supAplicarCorrecciones(candidatas).catch(e => console.error("Supervisor correcciones:", e.message));
@@ -2072,7 +2075,10 @@ Responde SOLO un arreglo JSON (sin texto extra). Cada error: {"id":"ID del conta
 
 // 4b) Convierte los errores en correcciones para Vero (sin duplicar ni contradecir) y avisa que se implementaron
 async function supAplicarCorrecciones(candidatas) {
+  const AUTO = process.env.SUP_AUTOCORREGIR === "si";
   const activas = await dbAll("SELECT n, texto FROM sup_lecciones WHERE activa = 1 ORDER BY n");
+  const pendientes = await dbAll("SELECT texto FROM sup_lecciones WHERE pendiente = 1 ORDER BY n");
+  const rechazadas = await dbAll("SELECT texto FROM sup_lecciones WHERE pendiente = 2 ORDER BY n DESC LIMIT 15");
   const r = await client.messages.create({
     model: "claude-sonnet-5", max_tokens: 2000, thinking: { type: "disabled" },
     system: `Mantienes la lista de CORRECCIONES que se agregan al prompt de Vero (asistente de reservas de Villa de Canto) para que no repita errores.
@@ -2086,13 +2092,35 @@ Recibes las correcciones activas (con numero) y correcciones nuevas propuestas. 
 - quitar: activas que quedaron duplicadas o contradicen las reglas oficiales.
 Nunca propongas cambiar precios, fechas de festivos, anticipo, deposito ni politicas del negocio: eso solo lo decide el dueno.
 Maximo 25 correcciones activas en total.
+Tambien recibes las propuestas que ya esperan aprobacion del dueno y las que el dueno RECHAZO: no repitas ninguna de las dos ni propongas algo equivalente.
 Responde SOLO JSON: {"agregar":[{"texto":"...","motivo":"error que la origino, 1 frase"}],"reemplazar":[{"n":1,"texto":"...","motivo":"..."}],"quitar":[{"n":2,"motivo":"..."}]}`,
-    messages: [{ role: "user", content: `Correcciones activas:\n${activas.map(a => `${a.n}. ${a.texto}`).join("\n") || "(ninguna)"}\n\nPropuestas nuevas:\n${candidatas.map((c, i) => `${i + 1}. ${c.correccion}  (por: ${c.error})`).join("\n")}` }],
+    messages: [{ role: "user", content: `Correcciones activas:\n${activas.map(a => `${a.n}. ${a.texto}`).join("\n") || "(ninguna)"}\n\nPropuestas nuevas:\n${candidatas.map((c, i) => `${i + 1}. ${c.correccion}  (por: ${c.error})`).join("\n")}\n\nYa esperan aprobacion (no repetir):\n${pendientes.map(a => "- " + a.texto).join("\n") || "(ninguna)"}\n\nRechazadas por el dueno (no volver a proponer):\n${rechazadas.map(a => "- " + a.texto).join("\n") || "(ninguna)"}` }],
   });
   const raw = (r.content || []).map(b => b.text || "").join("");
   let d = {};
   try { d = JSON.parse(raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1)); } catch (e) { console.error("Supervisor correcciones: no es JSON", raw.slice(0, 200)); return; }
   const ids = new Set(activas.map(a => a.n)), cambios = [];
+  if (!AUTO) {
+    // Modo aprobacion: nada se aplica solo; se guardan como propuestas y se avisa al dueno
+    const propuestas = [];
+    for (const x of (d.quitar || []).filter(x => ids.has(Number(x.n)))) {
+      const a = activas.find(a => a.n === Number(x.n));
+      await dbRun("INSERT INTO sup_lecciones (texto, motivo, creado, activa, pendiente, accion, reemplaza) VALUES (?, ?, ?, 0, 1, 'quitar', ?)", [a.texto, String(x.motivo || ""), Date.now(), a.n]);
+      propuestas.push(`➖ Quitar la #${a.n}: ${a.texto}${x.motivo ? ` _(${x.motivo})_` : ""}`);
+    }
+    for (const x of (d.reemplazar || []).filter(x => ids.has(Number(x.n)) && x.texto)) {
+      await dbRun("INSERT INTO sup_lecciones (texto, motivo, creado, activa, pendiente, accion, reemplaza) VALUES (?, ?, ?, 0, 1, 'reemplazar', ?)", [String(x.texto).slice(0, 400), String(x.motivo || ""), Date.now(), Number(x.n)]);
+      propuestas.push(`✏️ Ajustar la #${x.n}: ${x.texto}${x.motivo ? ` _(${x.motivo})_` : ""}`);
+    }
+    for (const x of (d.agregar || []).filter(x => x && x.texto).slice(0, 5)) {
+      await dbRun("INSERT INTO sup_lecciones (texto, motivo, creado, activa, pendiente, accion) VALUES (?, ?, ?, 0, 1, 'agregar')", [String(x.texto).slice(0, 400), String(x.motivo || ""), Date.now()]);
+      propuestas.push(`➕ Agregar: ${x.texto}${x.motivo ? ` _(por: ${x.motivo})_` : ""}`);
+    }
+    if (!propuestas.length) return;
+    await supEnviar(["🛠️ *Supervisor de Vero · propuestas por aprobar*", "Encontré cómo corregir esto. No cambié nada: tú decides.", "", ...propuestas, "", `Aprobar o rechazar: ${linkSup()}#propuestas`].join("\n"));
+    console.log("Supervisor: propuestas por aprobar", propuestas.length);
+    return;
+  }
   for (const x of (d.quitar || []).filter(x => ids.has(Number(x.n)))) {
     await dbRun("UPDATE sup_lecciones SET activa = 0, quitada = ? WHERE n = ?", [Date.now(), Number(x.n)]);
     cambios.push(`➖ Quité la #${x.n}: ${activas.find(a => a.n === Number(x.n)).texto}${x.motivo ? ` _(${x.motivo})_` : ""}`);
@@ -2164,6 +2192,24 @@ app.get("/supervisor/leccion", async (req, res) => {
   }
   res.redirect(linkSup() + "#correcciones");
 });
+app.get("/supervisor/propuesta", async (req, res) => {
+  if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
+  const n = Number(req.query.n), p = await dbGet("SELECT * FROM sup_lecciones WHERE n = ? AND pendiente = 1", [n]);
+  if (p && req.query.accion === "aprobar") {
+    if (p.accion === "agregar") await dbRun("UPDATE sup_lecciones SET activa = 1, pendiente = 0, accion = NULL, creado = ? WHERE n = ?", [Date.now(), n]);
+    else {
+      if (p.accion === "reemplazar") await dbRun("UPDATE sup_lecciones SET texto = ?, motivo = ?, creado = ? WHERE n = ? AND activa = 1", [p.texto, p.motivo || "", Date.now(), p.reemplaza]);
+      else await dbRun("UPDATE sup_lecciones SET activa = 0, quitada = ? WHERE n = ?", [Date.now(), p.reemplaza]);
+      await dbRun("DELETE FROM sup_lecciones WHERE n = ?", [n]);
+    }
+    supCargarLecciones();
+    console.log("Propuesta", n, "(" + p.accion + ") aprobada por el administrador");
+  } else if (p && req.query.accion === "rechazar") {
+    await dbRun("UPDATE sup_lecciones SET pendiente = 2, quitada = ? WHERE n = ?", [Date.now(), n]);
+    console.log("Propuesta", n, "rechazada por el administrador");
+  }
+  res.redirect(linkSup() + "#propuestas");
+});
 app.get("/supervisor/resolver", async (req, res) => {
   if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
   if (req.query.firma === "todas") await dbRun("UPDATE sup_alertas SET resuelta = 1 WHERE resuelta = 0");
@@ -2180,7 +2226,8 @@ app.get("/supervisor", async (req, res) => {
   const [ab] = await dbAll("SELECT COUNT(*) n FROM sup_alertas WHERE resuelta = 0");
   const al = await dbAll(`SELECT * FROM sup_alertas WHERE resuelta = ? ORDER BY CASE gravedad WHEN 'alta' THEN 0 WHEN 'media' THEN 1 ELSE 2 END, t DESC LIMIT 200`, [ver === "resueltas" ? 1 : 0]);
   const latido = Number(await supGet("latido") || 0), ultIA = Number(await supGet("ultima_ia") || 0);
-  const lecs = await dbAll("SELECT * FROM sup_lecciones ORDER BY activa DESC, creado DESC LIMIT 60");
+  const lecs = await dbAll("SELECT * FROM sup_lecciones WHERE pendiente = 0 ORDER BY activa DESC, creado DESC LIMIT 60");
+  const props = await dbAll("SELECT p.*, t.texto AS actual FROM sup_lecciones p LEFT JOIN sup_lecciones t ON t.n = p.reemplaza WHERE p.pendiente = 1 ORDER BY p.creado");
   const clave = process.env.CLAVE_REVISION ? "&clave=" + encodeURIComponent(process.env.CLAVE_REVISION) : "";
   const hora = t => t ? new Date(t - MX).toISOString().slice(0, 16).replace("T", " ") : "—";
   const color = g => g === "alta" ? "#ec3013" : g === "media" ? "#201e1d" : "#8a8584";
@@ -2210,6 +2257,15 @@ app.get("/supervisor", async (req, res) => {
   ${ver === "abiertas" && al.length ? `<a href="${URL_PUBLICA}/supervisor/resolver?firma=todas${clave}" style="padding:10px 16px;font-weight:700;text-decoration:none;border:2px solid #201e1d;color:#201e1d">Marcar todo resuelto</a>` : ""}
 </div>
 ${al.length ? `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:15px"><thead><tr style="border-bottom:2px solid #201e1d;text-align:left;font-size:12px;text-transform:uppercase;letter-spacing:.06em"><th style="padding:10px 12px">Gravedad</th><th style="padding:10px 12px">Error</th><th style="padding:10px 12px">Qué pasó</th><th style="padding:10px 12px">Contacto</th><th style="padding:10px 12px">Hora</th><th style="padding:10px 12px"></th></tr></thead><tbody>${filasHTML}</tbody></table></div>` : `<p style="font-size:20px;padding:32px 0;border-top:2px solid #201e1d">${ver === "abiertas" ? "Sin errores abiertos. Vero va bien." : "Nada resuelto todavía."}</p>`}
+<h2 id="propuestas" style="margin:48px 0 0;font-size:28px;padding-bottom:12px;border-bottom:2px solid #201e1d">Propuestas por aprobar${props.length ? ` (${props.length})` : ""}</h2>
+${props.length ? props.map(p => `<div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:start;padding:16px 0;border-bottom:1px solid #d6d3d2">
+  <div><div style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;font-weight:700;color:#b8240e">${p.accion === "quitar" ? "Quitar la #" + p.reemplaza : p.accion === "reemplazar" ? "Ajustar la #" + p.reemplaza : "Agregar"}</div>
+    <div style="margin-top:4px;font-size:16px;line-height:1.45;font-weight:700">${esc(p.texto)}</div>
+    ${p.accion === "reemplazar" && p.actual ? `<div style="margin-top:6px;font-size:13px;line-height:1.4;color:#8a8584">Ahora dice: ${esc(p.actual)}</div>` : ""}
+    <div style="margin-top:6px;font-size:13px;line-height:1.4">${p.motivo ? "Por: " + esc(p.motivo) + " · " : ""}Propuesta ${hora(p.creado)}</div></div>
+  <div style="display:flex;gap:8px"><a href="${URL_PUBLICA}/supervisor/propuesta?n=${p.n}&accion=aprobar${clave}" style="padding:6px 12px;background:#201e1d;color:#fff;border:2px solid #201e1d;text-decoration:none;font-weight:700;font-size:13px">Aprobar</a>
+  <a href="${URL_PUBLICA}/supervisor/propuesta?n=${p.n}&accion=rechazar${clave}" style="padding:6px 12px;border:2px solid #201e1d;color:#201e1d;text-decoration:none;font-weight:700;font-size:13px">Rechazar</a></div>
+</div>`).join("") : `<p style="font-size:16px;padding:16px 0">Sin propuestas pendientes. Cuando el supervisor encuentre cómo corregir un error, aparecerá aquí para que lo apruebes.</p>`}
 <h2 id="correcciones" style="margin:48px 0 0;font-size:28px;padding-bottom:12px;border-bottom:2px solid #201e1d">Correcciones que el supervisor le enseñó a Vero</h2>
 ${lecs.length ? lecs.map(l => `<div style="display:grid;grid-template-columns:56px minmax(0,1fr) auto;gap:16px;align-items:start;padding:16px 0;border-bottom:1px solid #d6d3d2;${l.activa ? "" : "opacity:.5"}">
   <div style="font-size:22px;font-weight:700;color:${l.activa ? "#ec3013" : "#8a8584"}">#${l.n}</div>
