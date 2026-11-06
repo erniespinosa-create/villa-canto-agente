@@ -207,6 +207,8 @@ async function crearEventoCalendar(datos) {
 const ultimoAseguro = new Map();
 async function asegurarApartado(id, telefono, motivo) {
   if (!id || Date.now() - (ultimoAseguro.get(id) || 0) < 10 * 60000) return;
+  // Si el cliente dijo que NO le interesa, solo se aparta si avisa que ya pago
+  if (!/pag[oó]/i.test(String(motivo)) && await dbGet("SELECT id FROM no_recordar WHERE id = ?", [String(id)])) return;
   ultimoAseguro.set(id, Date.now());
   try {
     const ev = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: [`contacto=${id}`], timeMin: new Date().toISOString(), singleEvents: true });
@@ -430,6 +432,15 @@ function horaRecordatorio(creado) {
   if (manana.getTime() + MX - creado <= 22.5 * 3600000) return manana.getTime() + MX;
   loc.setUTCHours(20, 30, 0, 0); // la manana ya queda fuera de las 24 h: mejor esa misma tarde
   return loc.getTime() + MX;
+}
+// Cliente que dijo que no: se borra su apartado pendiente (sin pago avisado) y NO se le manda mensaje
+async function liberarSinAviso(contacto) {
+  const r = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: [`contacto=${contacto}`, "estado=pendiente"], singleEvents: true });
+  for (const e of (r.data.items || []).filter(x => x.status !== "cancelled" && x.extendedProperties?.private?.pago !== "avisado")) {
+    await calendar.events.delete({ calendarId: CALENDAR_ID, eventId: e.id });
+    console.log("Apartado liberado (cliente dijo que no):", contacto, e.summary);
+    await bitacora("Liberada: cliente no interesado", { telefono: e.extendedProperties?.private?.telefono || "", eventoId: e.id }).catch(() => {});
+  }
 }
 async function marcarAvisoPago(contacto) {
   const r = await calendar.events.list({ calendarId: CALENDAR_ID, privateExtendedProperty: [`contacto=${contacto}`, "estado=pendiente"], singleEvents: true });
@@ -741,6 +752,7 @@ Solo UNA vez por cada reserva confirmada (no la repitas si solo estan platicando
 COTIZACION: solo cuando presentes una cotizacion para fechas concretas de llegada y salida que te dio el cliente (si solo pregunta precios en general, NO lo agregues), agrega al FINAL de tu respuesta, en su propia linea (el cliente no lo vera): COTIZACION_JSON:{"llegada":"DD/MM/AAAA","salida":"DD/MM/AAAA","total":N}
 
 SI DICE QUE NO: si el cliente dice que ya no le interesa, que no va a reservar, que ya reservo en otro lugar o que no le escriban, respondele con calidez y sin insistir (agradece y dejale la puerta abierta), y agrega al FINAL, en su propia linea: NO_INTERESADO. Si solo dice que lo va a pensar o que despues te avisa, NO lo uses.
+DATOS BANCARIOS SOLO CON UN SI CLARO: manda los datos bancarios UNICAMENTE si el cliente dice claramente que quiere apartar o pagar ("si, apartalo", "quiero apartar", "pasame la cuenta", "como pago"). Frases como "son las fechas que requiero", "ok", "gracias", "lo platico" o que solo repita sus fechas NO son un si: en ese caso pregunta "¿Quieres que te las aparte?" y espera su respuesta. Si en sus mensajes recientes dijo "no", "por el momento no", "ahorita no" o algo parecido, NUNCA mandes datos bancarios: respeta su respuesta.
 
 EL CALENDARIO MANDA: lo que se hablo antes en esta conversacion puede estar desactualizado (el administrador puede cancelar o borrar reservas). Antes de decir que el cliente ya tiene una reserva, o si pregunta por su reserva o su pago, usa consultar_mis_reservas y confia SOLO en ese resultado. Si el cliente dice que la reserva la hizo con el administrador, pasa su nombre completo en el campo nombre: tambien se buscan las reservas que el administrador agendo a mano. Si ahi no aparece, NO la tiene: tratala como reserva nueva (consulta disponibilidad, cotiza y genera un nuevo RESERVA_JSON cuando confirme). Nunca digas "ya la tenemos registrada" sin haberlo consultado.
 
@@ -1267,6 +1279,7 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
         mensajeCliente = mensajeCliente.replace(/NO_INTERESADO/g, "").trim();
         db.run("INSERT OR REPLACE INTO no_recordar (id) VALUES (?)", [phoneNumber]);
         console.log("NO INTERESADO: ya no se le mandan recordatorios a", phoneNumber);
+        liberarSinAviso(phoneNumber).catch(e => console.error("Liberar no interesado:", e.message));
       }
       let avisoPago = "no";
       if (mensajeCliente.includes("AVISO_PAGO")) {
@@ -1836,7 +1849,8 @@ async function auditarApartados() {
   const filas = await new Promise(ok => db.all("SELECT id, messages FROM conversations WHERE updated_at >= datetime('now', '-3 days')", [], (e, r) => ok(e ? [] : r || [])));
   for (const f of filas) {
     const txt = String(f.messages || "");
-    if (/PAGO_CONFIRMADO|AVISO_PAGO|012680004746940744/.test(txt)) await asegurarApartado(String(f.id), null, "Revisión automática: hubo pago o datos bancarios en la conversación");
+    if (/PAGO_CONFIRMADO|AVISO_PAGO/.test(txt)) await asegurarApartado(String(f.id), null, "Revisión automática: el cliente avisó que ya pagó");
+    else if (/012680004746940744/.test(txt)) await asegurarApartado(String(f.id), null, "Revisión automática: Vero le mandó datos bancarios");
   }
 }
 setTimeout(() => auditarApartados().catch(e => console.error("Auditoria:", e.message)), 60000);
@@ -2292,6 +2306,16 @@ ${lecs.length ? lecs.map(l => `<div style="display:grid;grid-template-columns:56
 });
 
 const server = app.listen(PORT, () => console.log(`Agente Vero en puerto ${PORT}`));
+// Etiqueta "admin_avisos" en ManyChat a los administradores de AVISO_ADMINS: el flujo de aviso debe enviarse SOLO a quien la tenga
+setTimeout(async () => {
+  if (!process.env.MANYCHAT_API_KEY || !ADMINS_AVISO.length) return;
+  const mc = (ruta, body) => fetch("https://api.manychat.com/fb/" + ruta, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.MANYCHAT_API_KEY}` }, body: JSON.stringify(body) }).then(r => r.json());
+  await mc("page/createTag", { name: "admin_avisos" }).catch(() => {});
+  for (const admin of ADMINS_AVISO) {
+    const d = await mc("subscriber/addTagByName", { subscriber_id: admin, tag_name: "admin_avisos" }).catch(e => ({ status: e.message }));
+    console.log("Etiqueta admin_avisos ->", admin, d && d.status);
+  }
+}, 20000);
 setInterval(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 60 * 60 * 1000);
 setTimeout(() => enviarPostEstancia().catch(e => console.error("Post-estancia:", e.message)), 30000);
 setInterval(() => liberarPendientes().catch(e => console.error("Liberar:", e.message)), 60 * 60 * 1000);
