@@ -20,6 +20,26 @@ const CALENDAR_ID = process.env.CALENDAR_ID;
 const sheets = google.sheets({ version: "v4", auth });
 const SHEET_ID = process.env.SHEET_ID;
 
+// CRM (villadecantocrm.netlify.app / Firestore): registra leads y cotizaciones en la coleccion "leads"
+let crmDb = null;
+try {
+  if (process.env.FIREBASE_CRM_KEY) {
+    const { initializeApp, cert } = require("firebase-admin/app");
+    const { getFirestore } = require("firebase-admin/firestore");
+    const crmKey = JSON.parse(process.env.FIREBASE_CRM_KEY);
+    const crmApp = initializeApp({ credential: cert(crmKey) }, "crm");
+    crmDb = getFirestore(crmApp);
+  }
+} catch (e) {
+  console.error("CRM Firebase init:", e.message);
+}
+
+// Crea o actualiza (merge) el documento del lead en Firestore, mismo esquema que usa el CRM al capturar a mano
+function crmLead(id, datos) {
+  if (!crmDb) return Promise.resolve();
+  return crmDb.collection("leads").doc(String(id)).set(datos, { merge: true }).catch(e => console.error("CRM lead:", e.message));
+}
+
 // Bitacora: agrega un renglon a la hoja "Reservas" de Google Sheets
 async function bitacora(estado, d) {
   if (!SHEET_ID) return;
@@ -1170,7 +1190,9 @@ const pideHablarConPersona = t => { const s = String(t || ""); return !s.startsW
 function procesarConClaude(phoneNumber, telefono, message, res) {
   db.get("SELECT messages FROM conversations WHERE id = ?", [phoneNumber], async (err, row) => {
     if (!row) {
-      bitacora("Nuevo lead", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber }).catch(() => {});
+      const telLead = (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber;
+      bitacora("Nuevo lead", { telefono: telLead }).catch(() => {});
+      crmLead(phoneNumber, { nombre: "", contacto: telLead, canal: "WhatsApp", fecha: new Date().toLocaleString("en-CA", { timeZone: "America/Mexico_City" }).slice(0, 10), fechas: "", personas: 0, cuando: "", estado: "nuevo", notas: "", reservaId: "" });
     }
     let history = row ? JSON.parse(row.messages) : [];
     history.push({ role: "user", content: String(message) });
@@ -1275,7 +1297,7 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
       const cot = mensajeCliente.match(/COTIZACION_JSON:(\{.*?\})/);
       if (cot) {
         mensajeCliente = mensajeCliente.replace(cot[0], "").trim();
-        try { const q = JSON.parse(cot[1]); const f = v => String(v || "").trim().replace(/-/g, "/"), esFecha = v => /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(v); q.llegada = f(q.llegada); q.salida = f(q.salida); if (!esFecha(q.llegada) || !esFecha(q.salida)) throw new Error("sin fechas, no se guarda"); db.run("INSERT OR REPLACE INTO cotizaciones (id, llegada, salida, total, creado, recordatorio) VALUES (?, ?, ?, ?, ?, NULL)", [phoneNumber, q.llegada, q.salida, q.total || 0, Date.now()]); db.run("DELETE FROM no_recordar WHERE id = ?", [phoneNumber]); console.log("Cotizacion guardada", phoneNumber, q.llegada, "-", q.salida); bitacora("Cotizado", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber, llegada: q.llegada, salida: q.salida, total: q.total || 0 }).catch(() => {}); }
+        try { const q = JSON.parse(cot[1]); const f = v => String(v || "").trim().replace(/-/g, "/"), esFecha = v => /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(v); q.llegada = f(q.llegada); q.salida = f(q.salida); if (!esFecha(q.llegada) || !esFecha(q.salida)) throw new Error("sin fechas, no se guarda"); db.run("INSERT OR REPLACE INTO cotizaciones (id, llegada, salida, total, creado, recordatorio) VALUES (?, ?, ?, ?, ?, NULL)", [phoneNumber, q.llegada, q.salida, q.total || 0, Date.now()]); db.run("DELETE FROM no_recordar WHERE id = ?", [phoneNumber]); console.log("Cotizacion guardada", phoneNumber, q.llegada, "-", q.salida); bitacora("Cotizado", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber, llegada: q.llegada, salida: q.salida, total: q.total || 0 }).catch(() => {}); crmLead(phoneNumber, { fechas: `${q.llegada} - ${q.salida}`, estado: "cotizado" }); }
         catch (e) { console.error("Cotizacion:", e.message); }
       }
       if (mensajeCliente.includes("NO_INTERESADO")) {
