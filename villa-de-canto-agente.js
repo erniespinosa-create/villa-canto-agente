@@ -1169,6 +1169,9 @@ const pideHablarConPersona = t => { const s = String(t || ""); return !s.startsW
 
 function procesarConClaude(phoneNumber, telefono, message, res) {
   db.get("SELECT messages FROM conversations WHERE id = ?", [phoneNumber], async (err, row) => {
+    if (!row) {
+      bitacora("Nuevo lead", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber }).catch(() => {});
+    }
     let history = row ? JSON.parse(row.messages) : [];
     history.push({ role: "user", content: String(message) });
 
@@ -1272,7 +1275,7 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
       const cot = mensajeCliente.match(/COTIZACION_JSON:(\{.*?\})/);
       if (cot) {
         mensajeCliente = mensajeCliente.replace(cot[0], "").trim();
-        try { const q = JSON.parse(cot[1]); const f = v => String(v || "").trim().replace(/-/g, "/"), esFecha = v => /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(v); q.llegada = f(q.llegada); q.salida = f(q.salida); if (!esFecha(q.llegada) || !esFecha(q.salida)) throw new Error("sin fechas, no se guarda"); db.run("INSERT OR REPLACE INTO cotizaciones (id, llegada, salida, total, creado, recordatorio) VALUES (?, ?, ?, ?, ?, NULL)", [phoneNumber, q.llegada, q.salida, q.total || 0, Date.now()]); db.run("DELETE FROM no_recordar WHERE id = ?", [phoneNumber]); console.log("Cotizacion guardada", phoneNumber, q.llegada, "-", q.salida); }
+        try { const q = JSON.parse(cot[1]); const f = v => String(v || "").trim().replace(/-/g, "/"), esFecha = v => /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(v); q.llegada = f(q.llegada); q.salida = f(q.salida); if (!esFecha(q.llegada) || !esFecha(q.salida)) throw new Error("sin fechas, no se guarda"); db.run("INSERT OR REPLACE INTO cotizaciones (id, llegada, salida, total, creado, recordatorio) VALUES (?, ?, ?, ?, ?, NULL)", [phoneNumber, q.llegada, q.salida, q.total || 0, Date.now()]); db.run("DELETE FROM no_recordar WHERE id = ?", [phoneNumber]); console.log("Cotizacion guardada", phoneNumber, q.llegada, "-", q.salida); bitacora("Cotizado", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber, llegada: q.llegada, salida: q.salida, total: q.total || 0 }).catch(() => {}); }
         catch (e) { console.error("Cotizacion:", e.message); }
       }
       if (mensajeCliente.includes("NO_INTERESADO")) {
