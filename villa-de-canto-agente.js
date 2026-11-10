@@ -734,7 +734,8 @@ PAGO:
   Nunca sumes el deposito al total de la renta, al anticipo ni al precio por persona. Si preguntan para que es: es solo un respaldo por danos, faltantes o limpieza extraordinaria, y casi siempre se regresa integro.
 
 REGLAS:
-- No des descuentos
+- No des descuentos. Si el cliente pide un descuento, rebaja o "mejor precio": no lo niegues tajante ni lo negocies tu; con calidez dile que le avisas al administrador de la villa para ver que se puede hacer, y continua la conversacion con normalidad (el sistema ya le avisa a Emilio/David por separado).
+- Si el cliente se queja (mala experiencia, algo sucio, algo que no funciono, un mal servicio): nunca te pongas a la defensiva ni discutas; ofrece una disculpa breve y sincera y dile que el administrador de la villa lo va a revisar personalmente (el sistema ya le avisa por separado).
 - Nunca pidas correo electronico
 
 IDIOMA: responde SIEMPRE en el idioma en que te escribe el cliente (espanol, ingles, frances, etc.). Si cambia de idioma, cambia tu tambien. Manten los precios en pesos mexicanos (MXN) y las fechas en formato DD/MM/AAAA. Los marcadores internos (RESERVA_JSON, PASAR_A_HUMANO, FOTOS_CASA, FOTOS_PINATAS, etc.) se escriben siempre igual, sin traducir.
@@ -1041,6 +1042,9 @@ const LIMITE_MS = Number(process.env.LIMITE_MS || 8500); // tiempo total desde q
 const procesando = new Set();
 const grupoGrande = new Map(); // clientes con grupo grande a los que les faltan fechas
 const planGrupo = new Map();
+const avisoQuejaDescuento = new Map(); // para no avisar dos veces por la misma queja/descuento en pocas horas
+const RE_QUEJA = /\b(mala experiencia|p[eé]sim[oa]|queja|quejarme|insatisfech[oa]|no (qued[eé]|estoy) (content[oa]|satisfech[oa])|estaba sucia|estaba sucio|no funcion[oó]|se rompi[oó]|estuvo mal|muy mal servicio|decepci[oó]n|reclam[oa]r?)\b/i;
+const RE_DESCUENTO = /\b(descuento|rebaja|m[aá]s barato|bajarle (al|el) precio|promoci[oó]n especial|me lo dejas en|alg[uú]n descuento|un mejor precio)\b/i;
 async function enviarPorManyChat(id, texto) {
   if (!process.env.MANYCHAT_API_KEY) { console.error("Falta MANYCHAT_API_KEY: no se pudo mandar la respuesta tardia a", id); return; }
   try {
@@ -1340,6 +1344,17 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
       const nNinos = maxNum(/(\d{1,3})\s*(niñ[oa]s?|nin[oa]s?|menores?)/g);
       const totalPersonas = Math.max(nPersonas, nAdultos + nNinos); // adultos + ninos
       const esGrupo = totalPersonas > 20; // 16-20 se cotiza con $750 por persona adicional; 21+ al administrador
+      // Queja o solicitud de descuento: se avisa a los administradores (sin cortar la respuesta de Vero), maximo una vez cada 6h por contacto
+      {
+        const tipoAviso = RE_QUEJA.test(txt) ? "queja" : RE_DESCUENTO.test(txt) ? "descuento" : null;
+        const ultimoAviso = avisoQuejaDescuento.get(phoneNumber + ":" + tipoAviso);
+        if (tipoAviso && (!ultimoAviso || Date.now() - ultimoAviso > 6 * 3600000)) {
+          avisoQuejaDescuento.set(phoneNumber + ":" + tipoAviso, Date.now());
+          const etiqueta = tipoAviso === "queja" ? "😟 QUEJA" : "💸 PIDE DESCUENTO";
+          avisarAdmins({ id: phoneNumber, telefono, texto: `${etiqueta}: ${message}` }).catch(e => console.error("Aviso queja/descuento:", e.message));
+          bitacora(tipoAviso === "queja" ? "Queja" : "Pidio descuento", { telefono: (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber, motivo: message }).catch(() => {});
+        }
+      }
       const FINAL_GRUPO = "¡Muchas gracias por compartirnos su plan! 🌿 En breve el administrador de la villa se pondrá en contacto contigo para darte una atención personalizada. ¡Gracias!";
       const espera = planGrupo.get(phoneNumber);
       if (espera && Date.now() - espera < 48 * 3600000) {
