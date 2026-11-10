@@ -1642,6 +1642,8 @@ async function enviarCalendarios(id, meses) {
 // Abrir en el navegador: URL/revisar?dias=7&clave=TU_CLAVE  (agrega ?nuevo=1 para rehacer el analisis)
 const textoDe = c => typeof c === "string" ? c : Array.isArray(c) ? c.filter(b => b.type === "text").map(b => b.text).join(" ") : "";
 const esc = s => String(s ?? "").replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+// Quita mitades sueltas de emoji (surrogates) que deja .slice() y que rompen el JSON que se manda a la API
+const limpiaTexto = s => String(s ?? "").replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "");
 const ETAPAS = ["Solo saludó", "Preguntó fechas o precio", "Recibió cotización", "Recibió datos de pago", "Apartó (pendiente de pago)", "Avisó que pagó", "Confirmada"];
 let reporteCache = null;
 async function datosRevision(dias) {
@@ -1677,7 +1679,7 @@ async function analizarConClaude(convs) {
   const r = await client.messages.create({
     model: "claude-sonnet-5", max_tokens: 8000, thinking: { type: "disabled" },
     system: "Eres el analista comercial de Villa de Canto (casa de descanso en Amazcala, Queretaro, para hasta 20 personas; tarifas $10,500 dom-jue, $12,000 viernes, $14,000 sabado (desde el 1 ene 2027: $11,500, $13,000 y $15,000); para apartar 50% de anticipo; el deposito en garantia de $5,000 se entrega a la llegada). Vero es la asistente de IA que atiende WhatsApp. Revisa conversaciones que NO terminaron en reserva y explica con honestidad por que se cayeron (precio, fechas ocupadas, Vero contesto mal o lento, Vero no contesto, falta de seguimiento, cliente solo cotizaba, etc.). Responde SOLO un JSON valido, sin texto extra, con esta forma: {\"resumen\":\"2-3 frases\",\"causas\":[{\"causa\":\"\",\"cuantas\":0,\"solucion\":\"\"}],\"cambios_vero\":[\"cambio concreto a las instrucciones de Vero\"],\"conversaciones\":[{\"id\":\"\",\"motivo\":\"1 frase\",\"accion\":\"que debe hacer el administrador\",\"mensaje\":\"mensaje corto y calido para reenganchar por WhatsApp, o vacio si no conviene\"}]}. Maximo 6 causas y 6 cambios, ordenados por impacto.",
-    messages: [{ role: "user", content: `Hoy es ${hoyMexico()}. Conversaciones abiertas:\n\n${texto}` }],
+    messages: [{ role: "user", content: limpiaTexto(`Hoy es ${hoyMexico()}. Conversaciones abiertas:\n\n${texto}`) }],
   });
   const raw = r.content.filter(b => b.type === "text").map(b => b.text).join("");
   try { return JSON.parse(raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1)); }
@@ -1698,6 +1700,25 @@ function htmlReporte(dias, convs, a, nombres) {
 <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:15px;border-top:2px solid #1b2b34"><tr style="text-align:left;background:#1b2b34;color:#e2d6cb"><th style="padding:12px 14px">Contacto</th><th style="padding:12px 14px">Etapa</th><th style="padding:12px 14px">Último</th><th style="padding:12px 14px">Por qué se frenó</th><th style="padding:12px 14px">Qué hacer</th><th style="padding:12px 14px">Mensaje sugerido</th></tr>${filas}</table></div>
 <div style="color:#4b5a62;font-size:13px">Generado ${esc(new Date().toLocaleString("es-MX", { timeZone: "America/Mexico_City" }))}. Se guarda 30 min; agrega &amp;nuevo=1 para rehacerlo.</div></div></body></html>`;
 }
+// EXPORTAR conversaciones en texto plano (solo lectura): /exportar?clave=CLAVE&dias=60&desde=0&limite=40
+// Los telefonos salen ocultos (solo los ultimos 4 digitos). Sirve para analisis de ventas.
+app.get("/exportar", async (req, res) => {
+  if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
+  const dias = Math.min(120, Math.max(1, Number(req.query.dias) || 60));
+  const desde = Math.max(0, Number(req.query.desde) || 0), limite = Math.min(80, Math.max(1, Number(req.query.limite) || 40));
+  try {
+    const todas = (await datosRevision(dias)).filter(c => !ADMINS_AVISO.includes(c.id));
+    const conteo = ETAPAS.map((n, i) => `${n}: ${todas.filter(c => c.etapa === i).length}`).join(" | ");
+    const pagina = todas.slice(desde, desde + limite);
+    const out = [`EXPORTACION Villa de Canto - ultimos ${dias} dias - ${todas.length} conversaciones (mostrando ${desde + 1}-${desde + pagina.length})`, `Por etapa: ${conteo}`, `Siguiente pagina: /exportar?dias=${dias}&desde=${desde + limite}&limite=${limite}&clave=...`, ""];
+    pagina.forEach((c, i) => {
+      out.push(`##### CONVERSACION ${desde + i + 1} | contacto ***${String(c.id).slice(-4)} | etapa: ${ETAPAS[c.etapa]} | ultimo mensaje de: ${c.sinRespuesta ? "CLIENTE (sin respuesta)" : "Vero"} | hace ${Math.round(c.horas)} h | ${c.msgs.length} mensajes`);
+      for (const m of c.msgs.slice(-40)) out.push(`${m.r === "user" ? "CLIENTE" : "VERO"}: ${m.t.slice(0, 500)}`);
+      out.push("");
+    });
+    res.type("text/plain; charset=utf-8").send(limpiaTexto(out.join("\n")));
+  } catch (e) { console.error("Exportar:", e.message); res.status(500).send("Error: " + e.message); }
+});
 // DIAGNOSTICO de una reserva: /diagnostico?clave=CLAVE&buscar=4611718139  (telefono, nombre o texto de la conversacion)
 app.get("/diagnostico", async (req, res) => {
   if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
@@ -2084,7 +2105,7 @@ Reglas clave a vigilar: revisar disponibilidad ANTES de cotizar; si esta ocupado
 Los textos entre corchetes como [consultó ...] o [SISTEMA] son internos y el cliente no los ve.
 
 Responde SOLO un arreglo JSON (sin texto extra). Cada error: {"id":"ID del contacto","tipo":"PRECIO_MAL|NO_REVISO_DISPONIBILIDAD|DATO_FALSO|NO_AGENDO|NO_PIDIO_ANTICIPO|FESTIVO_MINIMO|NO_AVISO_ADMIN|PREGUNTA_DE_MAS|SIN_RESPUESTA|NO_CERRO|TONO|OTRO","gravedad":"alta|media|baja","detalle":"que hizo mal y que debio hacer, maximo 2 frases","cita":"frase exacta de Vero, maximo 15 palabras","correccion":"instruccion para Vero en imperativo, general (sirve para cualquier cliente, sin nombres ni fechas de este caso), maximo 2 frases; vacio si el error ya esta cubierto por sus reglas y solo fue un descuido"}. Gravedad alta = pierde dinero, una reserva o un cliente. Si no hay errores responde [].`,
-    messages: [{ role: "user", content: `Hoy es ${hoyMexico()}. Conversaciones a revisar:\n\n${texto}` }],
+    messages: [{ role: "user", content: limpiaTexto(`Hoy es ${hoyMexico()}. Conversaciones a revisar:\n\n${texto}`) }],
   });
   const salida = (r.content || []).map(b => b.text || "").join("");
   let lista = [];
