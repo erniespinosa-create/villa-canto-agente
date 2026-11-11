@@ -1764,6 +1764,29 @@ app.get("/exportar", async (req, res) => {
     res.type("text/plain; charset=utf-8").send(limpiaTexto(out.join("\n")));
   } catch (e) { console.error("Exportar:", e.message); res.status(500).send("Error: " + e.message); }
 });
+// UNA SOLA VEZ: rellena el nombre de WhatsApp en los leads del CRM que quedaron "Sin nombre" antes de este cambio.
+// Borrar esta ruta despues de usarla. /backfill-nombres-crm?clave=CLAVE
+app.get("/backfill-nombres-crm", async (req, res) => {
+  if (!process.env.BACKFILL_KEY || req.query.clave !== process.env.BACKFILL_KEY) return res.status(401).send("Falta la clave");
+  if (!crmDb) return res.status(500).send("CRM no configurado (falta FIREBASE_CRM_KEY)");
+  try {
+    const snap = await crmDb.collection("leads").get();
+    const out = [];
+    for (const doc of snap.docs) {
+      const d = doc.data();
+      if (d.nombre) { continue; }
+      const info = await infoContacto(doc.id).catch(() => ({}));
+      const nombreWA = info && (info.name || [info.first_name, info.last_name].filter(Boolean).join(" "));
+      if (nombreWA) {
+        await crmDb.collection("leads").doc(doc.id).set({ nombre: nombreWA }, { merge: true });
+        out.push(`${doc.id} -> ${nombreWA}`);
+      } else {
+        out.push(`${doc.id} -> sin nombre en ManyChat`);
+      }
+    }
+    res.type("text/plain; charset=utf-8").send(`Revisados ${snap.size} leads.\n` + out.join("\n"));
+  } catch (e) { console.error("Backfill nombres CRM:", e.message); res.status(500).send("Error: " + e.message); }
+});
 // DIAGNOSTICO de una reserva: /diagnostico?clave=CLAVE&buscar=4611718139  (telefono, nombre o texto de la conversacion)
 app.get("/diagnostico", async (req, res) => {
   if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
