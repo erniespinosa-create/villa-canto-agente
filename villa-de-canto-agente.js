@@ -1196,7 +1196,12 @@ function procesarConClaude(phoneNumber, telefono, message, res) {
     if (!row) {
       const telLead = (telefono && !String(telefono).includes("{{")) ? telefono : phoneNumber;
       bitacora("Nuevo lead", { telefono: telLead }).catch(() => {});
-      crmLead(phoneNumber, { nombre: "", contacto: telLead, canal: "WhatsApp", fecha: new Date().toLocaleString("en-CA", { timeZone: "America/Mexico_City" }).slice(0, 10), fechas: "", personas: 0, cuando: "", estado: "nuevo", notas: "", reservaId: "" });
+      infoContacto(phoneNumber).then(info => {
+        const nombreWA = info && (info.name || [info.first_name, info.last_name].filter(Boolean).join(" "));
+        crmLead(phoneNumber, { nombre: nombreWA || "", contacto: telLead, canal: "WhatsApp", fecha: new Date().toLocaleString("en-CA", { timeZone: "America/Mexico_City" }).slice(0, 10), fechas: "", personas: 0, cuando: "", estado: "nuevo", notas: "", reservaId: "" });
+      }).catch(() => {
+        crmLead(phoneNumber, { nombre: "", contacto: telLead, canal: "WhatsApp", fecha: new Date().toLocaleString("en-CA", { timeZone: "America/Mexico_City" }).slice(0, 10), fechas: "", personas: 0, cuando: "", estado: "nuevo", notas: "", reservaId: "" });
+      });
     }
     let history = row ? JSON.parse(row.messages) : [];
     history.push({ role: "user", content: String(message) });
