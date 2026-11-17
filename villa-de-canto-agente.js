@@ -1794,6 +1794,19 @@ async function reportarViaPlantilla(texto) {
     return true;
   } catch (e) { console.error("Reporte semanal (plantilla):", e.message); return false; }
 }
+// DIAGNOSTICO TEMPORAL: ver que admins de AVISO_ADMINS existen y a que telefono corresponden.
+app.get("/admins-diag", async (req, res) => {
+  if (!process.env.REPORTE_KEY || req.query.clave !== process.env.REPORTE_KEY) return res.status(401).send("Falta la clave");
+  const out = [];
+  for (const admin of ADMINS_AVISO) {
+    try {
+      const i = await infoContacto(admin);
+      const tel = String(i.whatsapp_phone || i.phone || "").replace(/\D/g, "").slice(-10);
+      out.push({ admin, nombre: i.name || [i.first_name, i.last_name].filter(Boolean).join(" ") || null, tel10: tel || null });
+    } catch (e) { out.push({ admin, error: e.message }); }
+  }
+  res.json(out);
+});
 // /reporte-enviar?clave=REPORTE_KEY&texto=...
 app.get("/reporte-enviar", async (req, res) => {
   if (!process.env.REPORTE_KEY || req.query.clave !== process.env.REPORTE_KEY) return res.status(401).send("Falta la clave");
