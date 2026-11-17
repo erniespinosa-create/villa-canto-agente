@@ -1764,6 +1764,19 @@ app.get("/exportar", async (req, res) => {
     res.type("text/plain; charset=utf-8").send(limpiaTexto(out.join("\n")));
   } catch (e) { console.error("Exportar:", e.message); res.status(500).send("Error: " + e.message); }
 });
+// REPORTE SEMANAL (Etapa D, paso 13): un agente externo (Claude) arma el texto con datos de Meta Ads
+// y de la bitacora/CRM, y usa esta ruta solo para mandarselo a Emilio por WhatsApp (via supEnviar, el
+// mismo canal de los avisos del supervisor). No guarda nada ni expone datos; solo envia el texto dado.
+// /reporte-enviar?clave=REPORTE_KEY&texto=...
+app.get("/reporte-enviar", async (req, res) => {
+  if (!process.env.REPORTE_KEY || req.query.clave !== process.env.REPORTE_KEY) return res.status(401).send("Falta la clave");
+  const texto = String(req.query.texto || "").trim();
+  if (!texto) return res.status(400).send("Falta el texto");
+  try {
+    const ok = await supEnviar(texto);
+    res.send(ok ? "✅ Reporte enviado a Emilio" : "❌ No se pudo enviar (revisa logs / SUPERVISOR_TEL / ADMINS_AVISO)");
+  } catch (e) { console.error("Reporte semanal, envio:", e.message); res.status(500).send("Error: " + e.message); }
+});
 // DIAGNOSTICO de una reserva: /diagnostico?clave=CLAVE&buscar=4611718139  (telefono, nombre o texto de la conversacion)
 app.get("/diagnostico", async (req, res) => {
   if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
