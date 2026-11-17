@@ -1812,21 +1812,6 @@ app.get("/reporte-enviar", async (req, res) => {
     res.send(ok ? "✅ Reporte enviado a Emilio" : "❌ No se pudo enviar (revisa logs / SUPERVISOR_TEL / ADMINS_AVISO)");
   } catch (e) { console.error("Reporte semanal, envio:", e.message); res.status(500).send("Error: " + e.message); }
 });
-// TEMPORAL (diagnostico cuello de botella cotizado->pagado, Etapa D paso 14): lee el historial guardado de
-// una conversacion (solo IDs que ya aparecen en /cotiz-diag con recordatorio "respondio"). Quitar despues.
-app.get("/conv-diag", async (req, res) => {
-  if (!process.env.REPORTE_KEY || req.query.clave !== process.env.REPORTE_KEY) return res.status(401).send("Falta la clave");
-  const ids = String(req.query.ids || "").split(",").map(s => s.trim()).filter(Boolean);
-  if (!ids.length) return res.status(400).send("Falta ids=a,b,c");
-  try {
-    const out = {};
-    for (const id of ids) {
-      const conv = await dbGet("SELECT messages, updated_at FROM conversations WHERE id = ?", [id]);
-      out[id] = conv ? { updated_at: conv.updated_at, messages: JSON.parse(conv.messages) } : null;
-    }
-    res.type("json").send(JSON.stringify(out, null, 2));
-  } catch (e) { res.status(500).send("Error: " + e.message); }
-});
 // DIAGNOSTICO de una reserva: /diagnostico?clave=CLAVE&buscar=4611718139  (telefono, nombre o texto de la conversacion)
 app.get("/diagnostico", async (req, res) => {
   if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
