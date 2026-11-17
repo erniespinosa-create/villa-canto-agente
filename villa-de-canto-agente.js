@@ -1812,22 +1812,6 @@ app.get("/reporte-enviar", async (req, res) => {
     res.send(ok ? "✅ Reporte enviado a Emilio" : "❌ No se pudo enviar (revisa logs / SUPERVISOR_TEL / ADMINS_AVISO)");
   } catch (e) { console.error("Reporte semanal, envio:", e.message); res.status(500).send("Error: " + e.message); }
 });
-// TEMPORAL (diagnostico cuello de botella cotizado->pagado, Etapa D paso 14): revisa el estado real de
-// las cotizaciones guardadas en SQLite para ver por que no se mando recordatorio. Quitar despues de usarlo.
-app.get("/cotiz-diag", async (req, res) => {
-  if (!process.env.REPORTE_KEY || req.query.clave !== process.env.REPORTE_KEY) return res.status(401).send("Falta la clave");
-  try {
-    const rows = await new Promise((ok, bad) => db.all("SELECT * FROM cotizaciones ORDER BY creado DESC LIMIT 30", [], (e, r) => e ? bad(e) : ok(r || [])));
-    const out = [];
-    for (const q of rows) {
-      const conv = await dbGet("SELECT updated_at FROM conversations WHERE id = ?", [q.id]);
-      const norec = await dbGet("SELECT id FROM no_recordar WHERE id = ?", [q.id]);
-      const pausa = await dbGet("SELECT hasta FROM pausas WHERE id = ?", [q.id]);
-      out.push({ id: q.id, llegada: q.llegada, salida: q.salida, total: q.total, creado: new Date(q.creado).toISOString(), recordatorio: q.recordatorio, enviado_en: q.enviado_en ? new Date(q.enviado_en).toISOString() : null, ultimo_cliente: q.ultimo_cliente ? new Date(q.ultimo_cliente).toISOString() : null, conv_updated_at: conv ? conv.updated_at : null, en_no_recordar: !!norec, pausado_hasta: pausa ? new Date(pausa.hasta).toISOString() : null });
-    }
-    res.type("json").send(JSON.stringify(out, null, 2));
-  } catch (e) { res.status(500).send("Error: " + e.message); }
-});
 // DIAGNOSTICO de una reserva: /diagnostico?clave=CLAVE&buscar=4611718139  (telefono, nombre o texto de la conversacion)
 app.get("/diagnostico", async (req, res) => {
   if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
