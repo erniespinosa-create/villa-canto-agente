@@ -1770,11 +1770,13 @@ app.get("/exportar", async (req, res) => {
 // MANYCHAT_FLOW_REPORTE), para que llegue aunque hayan pasado mas de 24h desde que Emilio escribio por
 // ultima vez. Si esa plantilla/flujo no estan configurados, cae al canal anterior (supEnviar/texto libre).
 // No guarda nada ni expone datos; solo envia el texto dado.
-async function reportarViaPlantilla(texto) {
+async function reportarViaPlantilla(texto, telDestino) {
   if (!process.env.MANYCHAT_API_KEY || !process.env.MANYCHAT_FLOW_REPORTE) return null; // no configurado todavia
-  const tel10 = String(process.env.SUPERVISOR_TEL || "").replace(/\D/g, "").slice(-10);
-  const admin = await supDestinoManychat(tel10);
-  if (!admin) { console.error("Reporte semanal (plantilla): no encontré a Emilio en AVISO_ADMINS con SUPERVISOR_TEL", tel10 || "(vacío)"); return false; }
+  const tel10 = String(telDestino || process.env.SUPERVISOR_TEL || "").replace(/\D/g, "").slice(-10);
+  // Si se pide un destino explicito (telDestino) usamos la busqueda sin cache, para no quedarnos
+  // pegados al primer admin que se resolvio para SUPERVISOR_TEL en otra llamada.
+  const admin = telDestino ? await buscarAdminPorTel(tel10) : await supDestinoManychat(tel10);
+  if (!admin) { console.error("Reporte semanal (plantilla): no encontré en AVISO_ADMINS el telefono", tel10 || "(vacío)"); return false; }
   try {
     const r = await fetch("https://api.manychat.com/fb/subscriber/setCustomFieldByName", {
       method: "POST",
@@ -1794,28 +1796,18 @@ async function reportarViaPlantilla(texto) {
     return true;
   } catch (e) { console.error("Reporte semanal (plantilla):", e.message); return false; }
 }
-// DIAGNOSTICO TEMPORAL: ver que admins de AVISO_ADMINS existen y a que telefono corresponden.
-app.get("/admins-diag", async (req, res) => {
-  if (!process.env.REPORTE_KEY || req.query.clave !== process.env.REPORTE_KEY) return res.status(401).send("Falta la clave");
-  const out = [];
-  for (const admin of ADMINS_AVISO) {
-    try {
-      const i = await infoContacto(admin);
-      const tel = String(i.whatsapp_phone || i.phone || "").replace(/\D/g, "").slice(-10);
-      out.push({ admin, nombre: i.name || [i.first_name, i.last_name].filter(Boolean).join(" ") || null, tel10: tel || null });
-    } catch (e) { out.push({ admin, error: e.message }); }
-  }
-  res.json(out);
-});
-// /reporte-enviar?clave=REPORTE_KEY&texto=...
+// /reporte-enviar?clave=REPORTE_KEY&texto=...&tel=5214421234567 (tel es opcional: si no se da, va a
+// SUPERVISOR_TEL/Emilio como siempre; si se da, debe ser un numero ya dado de alta en AVISO_ADMINS).
 app.get("/reporte-enviar", async (req, res) => {
   if (!process.env.REPORTE_KEY || req.query.clave !== process.env.REPORTE_KEY) return res.status(401).send("Falta la clave");
   const texto = String(req.query.texto || "").trim();
   if (!texto) return res.status(400).send("Falta el texto");
+  const telDestino = String(req.query.tel || "").trim();
   try {
-    const viaPlantilla = await reportarViaPlantilla(texto);
-    if (viaPlantilla === true) return res.send("✅ Reporte enviado a Emilio (plantilla aprobada)");
-    if (viaPlantilla === false) return res.status(500).send("❌ No se pudo enviar por la plantilla (revisa logs / MANYCHAT_FLOW_REPORTE / SUPERVISOR_TEL)");
+    const viaPlantilla = await reportarViaPlantilla(texto, telDestino);
+    if (viaPlantilla === true) return res.send(`✅ Reporte enviado${telDestino ? " a " + telDestino : " a Emilio"} (plantilla aprobada)`);
+    if (viaPlantilla === false) return res.status(500).send("❌ No se pudo enviar por la plantilla (revisa logs / MANYCHAT_FLOW_REPORTE / que el numero este en AVISO_ADMINS)");
+    if (telDestino) return res.status(400).send("❌ La plantilla/flujo no estan configurados; no puedo mandar a otro numero sin ellos");
     const ok = await supEnviar(texto);
     res.send(ok ? "✅ Reporte enviado a Emilio" : "❌ No se pudo enviar (revisa logs / SUPERVISOR_TEL / ADMINS_AVISO)");
   } catch (e) { console.error("Reporte semanal, envio:", e.message); res.status(500).send("Error: " + e.message); }
@@ -2042,15 +2034,23 @@ async function supAlerta({ id = "", tipo, gravedad = "media", detalle, firma }) 
 // SUPERVISOR_TEL = celular de Emilio. Si hay WHAPI_TOKEN se le manda por Whapi; si no, por ManyChat al
 // administrador de AVISO_ADMINS que tenga ese telefono (o al codigo de SUPERVISOR_ADMIN, si se define).
 let supAdminId = String(process.env.SUPERVISOR_ADMIN || "").trim();
-async function supDestinoManychat(tel10) {
-  if (supAdminId) return supAdminId;
+// Busca en AVISO_ADMINS al administrador cuyo WhatsApp sea tel10, SIN cachear (para destinos puntuales
+// distintos de SUPERVISOR_TEL, p.ej. mandar el reporte semanal a otro numero ademas de Emilio).
+async function buscarAdminPorTel(tel10) {
   if (!tel10) return "";
   for (const admin of ADMINS_AVISO) {
     const i = await infoContacto(admin).catch(() => ({}));
     const t = String(i.whatsapp_phone || i.phone || "").replace(/\D/g, "").slice(-10);
-    if (t === tel10) { supAdminId = String(admin); return supAdminId; }
+    if (t === tel10) return String(admin);
   }
   return "";
+}
+async function supDestinoManychat(tel10) {
+  if (supAdminId) return supAdminId;
+  if (!tel10) return "";
+  const encontrado = await buscarAdminPorTel(tel10);
+  if (encontrado) supAdminId = encontrado;
+  return encontrado;
 }
 async function supEnviar(texto) {
   const tel = String(process.env.SUPERVISOR_TEL || "").replace(/\D/g, "");
