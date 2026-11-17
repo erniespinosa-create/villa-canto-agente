@@ -1794,20 +1794,6 @@ async function reportarViaPlantilla(texto) {
     return true;
   } catch (e) { console.error("Reporte semanal (plantilla):", e.message); return false; }
 }
-// DIAGNOSTICO TEMPORAL: confirmar que MANYCHAT_FLOW_REPORTE llega al proceso y que se encuentra a Emilio.
-app.get("/reporte-diag2", async (req, res) => {
-  if (!process.env.REPORTE_KEY || req.query.clave !== process.env.REPORTE_KEY) return res.status(401).send("Falta la clave");
-  const tel10 = String(process.env.SUPERVISOR_TEL || "").replace(/\D/g, "").slice(-10);
-  let admin = "";
-  try { admin = await supDestinoManychat(tel10); } catch (e) { admin = "ERROR:" + e.message; }
-  res.json({
-    tiene_MANYCHAT_API_KEY: !!process.env.MANYCHAT_API_KEY,
-    tiene_MANYCHAT_FLOW_REPORTE: !!process.env.MANYCHAT_FLOW_REPORTE,
-    MANYCHAT_FLOW_REPORTE: process.env.MANYCHAT_FLOW_REPORTE || null,
-    SUPERVISOR_TEL_tel10: tel10 || null,
-    admin_encontrado: admin || null,
-  });
-});
 // /reporte-enviar?clave=REPORTE_KEY&texto=...
 app.get("/reporte-enviar", async (req, res) => {
   if (!process.env.REPORTE_KEY || req.query.clave !== process.env.REPORTE_KEY) return res.status(401).send("Falta la clave");
