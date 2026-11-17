@@ -1777,6 +1777,27 @@ app.get("/reporte-enviar", async (req, res) => {
     res.send(ok ? "✅ Reporte enviado a Emilio" : "❌ No se pudo enviar (revisa logs / SUPERVISOR_TEL / ADMINS_AVISO)");
   } catch (e) { console.error("Reporte semanal, envio:", e.message); res.status(500).send("Error: " + e.message); }
 });
+// TEMPORAL: diagnostico de por que el reporte no llega (no manda nada, solo lee). Borrar despues de usar.
+app.get("/reporte-diag", async (req, res) => {
+  if (!process.env.REPORTE_KEY || req.query.clave !== process.env.REPORTE_KEY) return res.status(401).send("Falta la clave");
+  try {
+    const tel = String(process.env.SUPERVISOR_TEL || "").replace(/\D/g, "");
+    const tel10 = tel.slice(-10);
+    const out = [`SUPERVISOR_TEL configurado: ${tel ? "si, termina en " + tel10 : "NO ESTA CONFIGURADO"}`];
+    out.push(`WHAPI_TOKEN: ${process.env.WHAPI_TOKEN ? "configurado" : "no configurado"} | WHAPI_GRUPO: ${process.env.WHAPI_GRUPO ? "configurado" : "no configurado"}`);
+    out.push(`SUPERVISOR_ADMIN (fijo): ${process.env.SUPERVISOR_ADMIN || "(no fijo, se busca por telefono)"}`);
+    out.push(`Admins en AVISO_ADMINS: ${ADMINS_AVISO.length}`);
+    for (const admin of ADMINS_AVISO) {
+      const i = await infoContacto(admin).catch(e => ({ _error: e.message }));
+      const t = String(i.whatsapp_phone || i.phone || "").replace(/\D/g, "").slice(-10);
+      const nombre = i.name || [i.first_name, i.last_name].filter(Boolean).join(" ") || "(sin nombre)";
+      out.push(`- ${admin} | ${nombre} | telefono ManyChat: ${t || "(vacio)"} ${t === tel10 && tel10 ? "<-- COINCIDE con SUPERVISOR_TEL" : ""} ${i._error ? "ERROR: " + i._error : ""}`);
+    }
+    const destino = await supDestinoManychat(tel10);
+    out.push(`Admin resuelto para enviar: ${destino || "NINGUNO (por eso no llega nada, aunque la ruta responda con exito)"}`);
+    res.type("text/plain; charset=utf-8").send(out.join("\n"));
+  } catch (e) { console.error("Reporte diag:", e.message); res.status(500).send("Error: " + e.message); }
+});
 // DIAGNOSTICO de una reserva: /diagnostico?clave=CLAVE&buscar=4611718139  (telefono, nombre o texto de la conversacion)
 app.get("/diagnostico", async (req, res) => {
   if (process.env.CLAVE_REVISION && req.query.clave !== process.env.CLAVE_REVISION) return res.status(401).send("Falta la clave");
