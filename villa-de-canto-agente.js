@@ -1795,6 +1795,10 @@ app.get("/reporte-diag", async (req, res) => {
     }
     const destino = await supDestinoManychat(tel10);
     out.push(`Admin resuelto para enviar: ${destino || "NINGUNO (por eso no llega nada, aunque la ruta responda con exito)"}`);
+    if (destino) {
+      const r = await textoWA(destino, "🧪 Prueba 2 (diagnostico) - si ves esto en WhatsApp, avisame.").catch(e => ({ _error: e.message }));
+      out.push(`Respuesta cruda de ManyChat al intentar enviar: ${JSON.stringify(r)}`);
+    }
     res.type("text/plain; charset=utf-8").send(out.join("\n"));
   } catch (e) { console.error("Reporte diag:", e.message); res.status(500).send("Error: " + e.message); }
 });
