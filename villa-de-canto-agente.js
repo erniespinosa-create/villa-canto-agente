@@ -1765,14 +1765,44 @@ app.get("/exportar", async (req, res) => {
   } catch (e) { console.error("Exportar:", e.message); res.status(500).send("Error: " + e.message); }
 });
 // REPORTE SEMANAL (Etapa D, paso 13): un agente externo (Claude) arma el texto con datos de Meta Ads
-// y de la bitacora/CRM, y usa esta ruta solo para mandarselo a Emilio por WhatsApp (via supEnviar, el
-// mismo canal de los avisos del supervisor). No guarda nada ni expone datos; solo envia el texto dado.
+// y de la bitacora/CRM, y usa esta ruta solo para mandarselo a Emilio por WhatsApp. Se envia con la
+// plantilla aprobada de Meta "reporte_semanal" (campo personalizado reporte_texto + flujo de ManyChat
+// MANYCHAT_FLOW_REPORTE), para que llegue aunque hayan pasado mas de 24h desde que Emilio escribio por
+// ultima vez. Si esa plantilla/flujo no estan configurados, cae al canal anterior (supEnviar/texto libre).
+// No guarda nada ni expone datos; solo envia el texto dado.
+async function reportarViaPlantilla(texto) {
+  if (!process.env.MANYCHAT_API_KEY || !process.env.MANYCHAT_FLOW_REPORTE) return null; // no configurado todavia
+  const tel10 = String(process.env.SUPERVISOR_TEL || "").replace(/\D/g, "").slice(-10);
+  const admin = await supDestinoManychat(tel10);
+  if (!admin) { console.error("Reporte semanal (plantilla): no encontré a Emilio en AVISO_ADMINS con SUPERVISOR_TEL", tel10 || "(vacío)"); return false; }
+  try {
+    const r = await fetch("https://api.manychat.com/fb/subscriber/setCustomFieldByName", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.MANYCHAT_API_KEY}` },
+      body: JSON.stringify({ subscriber_id: admin, field_name: "reporte_texto", field_value: String(texto).slice(0, 1000) }),
+    });
+    const c = await r.json();
+    if (c.status !== "success") { console.error("Reporte semanal (campo reporte_texto):", JSON.stringify(c)); return false; }
+    // Hasta 3 intentos, igual que avisarAdmins: ManyChat a veces falla un momento.
+    let s = {};
+    for (let i = 0; i < 3; i++) {
+      try { s = await manychat("sendFlow", { subscriber_id: admin, flow_ns: process.env.MANYCHAT_FLOW_REPORTE }); } catch (e) { s = { status: "error", message: e.message }; }
+      if (s.status === "success") break;
+      await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+    }
+    if (s.status !== "success") { console.error("Reporte semanal (envio plantilla):", JSON.stringify(s)); return false; }
+    return true;
+  } catch (e) { console.error("Reporte semanal (plantilla):", e.message); return false; }
+}
 // /reporte-enviar?clave=REPORTE_KEY&texto=...
 app.get("/reporte-enviar", async (req, res) => {
   if (!process.env.REPORTE_KEY || req.query.clave !== process.env.REPORTE_KEY) return res.status(401).send("Falta la clave");
   const texto = String(req.query.texto || "").trim();
   if (!texto) return res.status(400).send("Falta el texto");
   try {
+    const viaPlantilla = await reportarViaPlantilla(texto);
+    if (viaPlantilla === true) return res.send("✅ Reporte enviado a Emilio (plantilla aprobada)");
+    if (viaPlantilla === false) return res.status(500).send("❌ No se pudo enviar por la plantilla (revisa logs / MANYCHAT_FLOW_REPORTE / SUPERVISOR_TEL)");
     const ok = await supEnviar(texto);
     res.send(ok ? "✅ Reporte enviado a Emilio" : "❌ No se pudo enviar (revisa logs / SUPERVISOR_TEL / ADMINS_AVISO)");
   } catch (e) { console.error("Reporte semanal, envio:", e.message); res.status(500).send("Error: " + e.message); }
