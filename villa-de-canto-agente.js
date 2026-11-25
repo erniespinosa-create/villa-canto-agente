@@ -1025,8 +1025,8 @@ const cancelados = new Set();
 const textoEnCurso = new Map();
 const ultimoCliente = new Map(); // contacto -> ultimo mensaje del cliente ya contestado (para detectar al administrador)
 const ECO_MIN_MS = Number(process.env.ECO_MIN_MS || 5000);
-function pausarPorAdmin(id, motivo) {
-  const horas = Number(process.env.HORAS_PAUSA || 12);
+function pausarPorAdmin(id, motivo, horasOpc) {
+  const horas = Number(horasOpc) > 0 ? Math.min(Number(horasOpc), 24 * 365) : Number(process.env.HORAS_PAUSA || 12);
   db.run("INSERT OR REPLACE INTO pausas (id, hasta) VALUES (?, ?)", [String(id), Date.now() + horas * 3600000]);
   const p = pendientes.get(id); if (p && p.timer) clearTimeout(p.timer);
   pendientes.delete(id); planGrupo.delete(id); grupoGrande.delete(id); ultimoCliente.delete(String(id));
@@ -1078,9 +1078,11 @@ app.get("/reiniciar/:id", (req, res) => {
 });
 
 // PAUSAR: el administrador toma el chat (etiqueta pausar-vero en ManyChat -> Solicitud externa GET /pausar/ID)
+// Opcional: /pausar/ID?horas=N (hasta 8760 = 1 año) para una pausa larga solo con ese contacto
 app.get("/pausar/:id", (req, res) => {
-  const horas = Number(process.env.HORAS_PAUSA || 12);
-  pausarPorAdmin(req.params.id, "pausa manual");
+  const hq = Number(req.query.horas);
+  const horas = hq > 0 ? Math.min(hq, 24 * 365) : Number(process.env.HORAS_PAUSA || 12);
+  pausarPorAdmin(req.params.id, "pausa manual", hq);
   res.send(`⏸️ Vero en pausa ${horas} h con ${req.params.id}. Para reactivarla: ${URL_PUBLICA}/continuar/${req.params.id}`);
 });
 
